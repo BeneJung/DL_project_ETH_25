@@ -729,6 +729,12 @@ class FLDD:
 # DATA PREPARATION
 # =============================================================================
 
+# The following function is defined in this location, since on MacOS threads are spawned differently as on Linux
+# I don't understand the details, but if we defined discretize(x) in some inside scope, the threads that Python
+# spawns can't find it
+def discretize(x):
+    return (x > 0.5).float()
+
 def prepare_data(batch_size=128):
     """
     Prepare binarized MNIST dataset.
@@ -738,16 +744,17 @@ def prepare_data(batch_size=128):
     """
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Lambda(lambda x: (x > 0.5).float())
+        transforms.Lambda(discretize)
     ])
     
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST('./data', train=False, transform=transform)
-    
+
+    is_pin_mem_available = torch.cuda.is_available()
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                             num_workers=2, pin_memory=True)
+                             num_workers=2, pin_memory=is_pin_mem_available)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=2, pin_memory=True)
+                            num_workers=2, pin_memory=is_pin_mem_available)
     
     return train_loader, test_loader
 
