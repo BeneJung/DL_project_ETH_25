@@ -24,6 +24,8 @@ from tqdm import tqdm
 import math
 import os
 
+from two_gaussians import TwoGaussians
+
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
@@ -92,6 +94,20 @@ class ResidualBlock(nn.Module):
         
         return h + self.skip(x)
 
+class FLDDTwoGaussians(nn.Module):
+
+    def __init__(self, time_dim = 128):
+        super().__init__()
+        self.time_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(time_dim),
+            nn.Linear(time_dim, time_dim * 4),
+            nn.GELU(),
+            nn.Linear(time_dim * 4, time_dim)
+        )
+        self.input_layer = nn.Sequential(
+            nn.Linear(2, 4),
+            nn.ReLU()
+        )
 
 class FLDDNetwork(nn.Module):
     """
@@ -107,7 +123,9 @@ class FLDDNetwork(nn.Module):
     
     Both networks have the same architecture as specified in the paper.
     """
-    def __init__(self, vocab_size=2, time_dim=128, hidden_dim=128):
+    def __init__(self, vocab_size=2, time_dim=128, input_layer = None, hidden_dim=128):
+        if input_layer is None: raise Exception("Input layer must exist")
+
         super().__init__()
         self.vocab_size = vocab_size
         self.time_dim = time_dim
@@ -121,7 +139,8 @@ class FLDDNetwork(nn.Module):
         )
         
         # Initial convolution: one-hot input → hidden
-        self.init_conv = nn.Conv2d(vocab_size, hidden_dim, 3, padding=1)
+        # self.init_conv = nn.Conv2d(vocab_size, hidden_dim, 3, padding=1) # Old MNIST input layer
+        self.init_conv = input_layer
         
         # Encoder (downsampling path)
         self.enc1 = ResidualBlock(hidden_dim, hidden_dim, time_dim)
@@ -388,7 +407,7 @@ class FLDD:
     3. Two-phase training: Concrete warm-up → REINFORCE
     """
     
-    def __init__(self, vocab_size=2, num_timesteps=10, hidden_dim=128, time_dim=128):
+    def __init__(self, vocab_size=2, num_timesteps=10, input_layer = None, hidden_dim=128, time_dim=128):
         """
         Args:
             vocab_size: Number of discrete values (2 for binary MNIST)
@@ -404,10 +423,10 @@ class FLDD:
         # Networks
         # =====================================================================
         # Forward network: takes x (data), outputs u_φ(x, t) for q_φ(z_t|x)
-        self.forward_net = FLDDNetwork(vocab_size, time_dim, hidden_dim).to(device)
+        self.forward_net = FLDDNetwork(vocab_size, time_dim, input_layer, hidden_dim).to(device)
         
         # Reverse network: takes z_t, outputs v_θ(z_t, t) for p_θ(z_s|z_t)
-        self.reverse_net = FLDDNetwork(vocab_size, time_dim, hidden_dim).to(device)
+        self.reverse_net = FLDDNetwork(vocab_size, time_dim, input_layer, hidden_dim).to(device)
         
         # =====================================================================
         # Optimizer (AdamW with lr=2e-4 as in paper Appendix A)
@@ -533,7 +552,7 @@ class FLDD:
         As training progresses, the temperature decreases, making samples
         more discrete-like.
         """
-        batch_size = x.shape[0]
+        #batch_size = x.shape[0]
         
         # Sample uniform timestep t ∈ {1, ..., T}
         t = torch.randint(1, self.num_timesteps + 1, (1,)).item()
@@ -582,7 +601,7 @@ class FLDD:
         1. Direct path: ∇_φ KL (through posterior parameters)
         2. REINFORCE path: log q_φ(z_t|x) × [KL]_sg (score function gradient)
         """
-        batch_size = x.shape[0]
+        #batch_size = x.shape[0]
         
         # Sample timestep t ∈ {1, ..., T}
         t = torch.randint(1, self.num_timesteps + 1, (1,)).item()
@@ -735,7 +754,7 @@ class FLDD:
 def discretize(x):
     return (x > 0.5).float()
 
-def prepare_data(batch_size=128):
+def prepare_data(dataset = "MNIST", batch_size=128):
     """
     Prepare binarized MNIST dataset.
     
@@ -746,9 +765,19 @@ def prepare_data(batch_size=128):
         transforms.ToTensor(),
         transforms.Lambda(discretize)
     ])
-    
-    train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST('./data', train=False, transform=transform)
+
+    train_dataset = None
+    test_dataset = None
+
+    match dataset:
+        case "MNIST":
+            train_dataset = datasets.MNIST('./data', train=True, transform=transform)
+            test_dataset = datasets.MNIST('./data', train=False, transform=transform)
+        case "TwoGaussians":
+            train_dataset = TwoGaussians()
+            test_dataset = train_dataset
+        case _:
+            raise Exception(f"Unknown dataset: {dataset}")
 
     is_pin_mem_available = torch.cuda.is_available()
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
@@ -782,13 +811,13 @@ def train_model(model, train_loader, num_epochs=None):
     for epoch in range(total_epochs):
         epoch_losses = []
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{total_epochs}')
-        
+
         for batch_idx, (data, _) in enumerate(pbar):
             if model.current_step >= model.total_steps:
                 break
-            
+
             # Prepare data: [batch, 1, H, W] → [batch, H, W]
-            data = data.squeeze(1).to(device)
+            data = data.squeeze().to(device)
             
             # Training step
             loss = model.train_step(data)
@@ -898,16 +927,21 @@ def main():
     
     # Create output directory
     os.makedirs('./outputs', exist_ok=True)
-    
+
     # Prepare data
-    train_loader, test_loader = prepare_data(batch_size=128)
+    dataset_name = "MNIST"
+    train_loader, test_loader = prepare_data(dataset=dataset_name, batch_size=128)
     
     # Initialize model
     # Using T=10 as in paper experiments for few-step generation
+    vocab_size, num_timesteps = (2, 10) if dataset_name == "MNIST" else (50, 2)
+    hidden_dim = 128
+    input_layer = nn.Conv2d(vocab_size, hidden_dim, 3, padding=1) if dataset_name == "MNIST" else nn.Linear(2, hidden_dim)
     model = FLDD(
-        vocab_size=2,      # Binary images
-        num_timesteps=10,  # Few-step generation
-        hidden_dim=128,
+        vocab_size=vocab_size,      # Binary images
+        num_timesteps=num_timesteps,  # Few-step generation
+        input_layer=input_layer,
+        hidden_dim=hidden_dim,
         time_dim=128
     )
     
@@ -928,7 +962,7 @@ def main():
     print("=" * 60)
     
     # Train model
-    losses = train_model(model, train_loader)
+    losses = train_model(model, train_loader, num_epochs = None)
     
     # Plot training curve
     plt.figure(figsize=(10, 4))
