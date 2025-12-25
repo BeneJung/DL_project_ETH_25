@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from dask.array import shape
 from torch.distributions import Categorical, RelaxedOneHotCategorical
 import numpy as np
 from torchvision import datasets, transforms
@@ -96,18 +97,37 @@ class ResidualBlock(nn.Module):
 
 class FLDDTwoGaussians(nn.Module):
 
-    def __init__(self, time_dim = 128):
+    def __init__(self, input_dim = 2, vocab_size = 50, time_dim = 10, hidden_dim = 20):
         super().__init__()
+        self.vocab_size = vocab_size
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_dim),
-            nn.Linear(time_dim, time_dim * 4),
-            nn.GELU(),
-            nn.Linear(time_dim * 4, time_dim)
-        )
-        self.input_layer = nn.Sequential(
-            nn.Linear(2, 4),
+            nn.Linear(time_dim, time_dim),
             nn.ReLU()
         )
+        self.concatenator = torch.cat
+        # Now we infer for each input dimension and discrete value from the vocab the "probability" (logit to be exact)
+        # that this dimension has that discrete value. Hence the output vector has size input_dim * vocab_size
+        self.main_network = nn.Sequential(
+            nn.Linear(2 + time_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, input_dim * vocab_size),
+        )
+
+    def forward(self, x, time):
+        if x.dim() == 4:
+            # Convert soft one-hot/probabilities back to expected coordinate values
+            # Using expectation or argmax to get a [Batch, 2] vector
+            new_x = torch.argmax(x, dim=1).squeeze(-1).float()
+        else:
+            new_x = x.float()
+        time_emb = self.time_mlp(time.float())
+        h = self.concatenator((new_x, time_emb))
+        output = self.main_network(h)
+        logits = output.view(-1, 2, 1, self.vocab_size)
+        return logits
 
 class FLDDNetwork(nn.Module):
     """
@@ -123,8 +143,7 @@ class FLDDNetwork(nn.Module):
     
     Both networks have the same architecture as specified in the paper.
     """
-    def __init__(self, vocab_size=2, time_dim=128, input_layer = None, hidden_dim=128):
-        if input_layer is None: raise Exception("Input layer must exist")
+    def __init__(self, vocab_size=2, time_dim=128, hidden_dim=128):
 
         super().__init__()
         self.vocab_size = vocab_size
@@ -139,8 +158,7 @@ class FLDDNetwork(nn.Module):
         )
         
         # Initial convolution: one-hot input → hidden
-        # self.init_conv = nn.Conv2d(vocab_size, hidden_dim, 3, padding=1) # Old MNIST input layer
-        self.init_conv = input_layer
+        self.init_conv = nn.Conv2d(vocab_size, hidden_dim, 3, padding=1)
         
         # Encoder (downsampling path)
         self.enc1 = ResidualBlock(hidden_dim, hidden_dim, time_dim)
@@ -269,8 +287,6 @@ class MaximumCoupling:
         Returns:
             u_s_given_t: [batch, H, W, vocab] - posterior parameters (sum to 1)
         """
-        batch_size, H, W, vocab = u_s.shape
-        device = u_s.device
         eps = 1e-8
         
         # =====================================================================
@@ -407,7 +423,7 @@ class FLDD:
     3. Two-phase training: Concrete warm-up → REINFORCE
     """
     
-    def __init__(self, vocab_size=2, num_timesteps=10, input_layer = None, hidden_dim=128, time_dim=128):
+    def __init__(self, vocab_size=2, num_timesteps=10, hidden_dim=128, time_dim=128):
         """
         Args:
             vocab_size: Number of discrete values (2 for binary MNIST)
@@ -423,10 +439,10 @@ class FLDD:
         # Networks
         # =====================================================================
         # Forward network: takes x (data), outputs u_φ(x, t) for q_φ(z_t|x)
-        self.forward_net = FLDDNetwork(vocab_size, time_dim, input_layer, hidden_dim).to(device)
+        self.forward_net = FLDDNetwork(vocab_size, time_dim, hidden_dim).to(device)
         
         # Reverse network: takes z_t, outputs v_θ(z_t, t) for p_θ(z_s|z_t)
-        self.reverse_net = FLDDNetwork(vocab_size, time_dim, input_layer, hidden_dim).to(device)
+        self.reverse_net = FLDDNetwork(vocab_size, time_dim, hidden_dim).to(device)
         
         # =====================================================================
         # Optimizer (AdamW with lr=2e-4 as in paper Appendix A)
@@ -578,8 +594,7 @@ class FLDD:
         As training progresses, the temperature decreases, making samples
         more discrete-like.
         """
-        #batch_size = x.shape[0]
-        
+
         # Sample uniform timestep t ∈ {1, ..., T}
         t = torch.randint(1, self.num_timesteps + 1, (1,)).item()
         s = t - 1  # Previous timestep
@@ -844,11 +859,12 @@ def train_model(model, train_loader, num_epochs=None):
         epoch_losses = []
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{total_epochs}')
 
+        # TODO: think about whether we should train in batches or, as in the paper, with single datapoints
         for batch_idx, (data, _) in enumerate(pbar):
             if model.current_step >= model.total_steps:
                 break
 
-            # Prepare data: [batch, 1, H, W] → [batch, H, W]
+            # In case of MNIST converts [batch, 1, H, W] → [batch, H, W]
             data = data.squeeze().to(device)
             
             # Training step
@@ -967,13 +983,10 @@ def main():
     # Initialize model
     # Using T=10 as in paper experiments for few-step generation
     vocab_size, num_timesteps = (2, 10) if dataset_name == "MNIST" else (50, 2)
-    hidden_dim = 128
-    input_layer = nn.Conv2d(vocab_size, hidden_dim, 3, padding=1) if dataset_name == "MNIST" else nn.Linear(2, hidden_dim)
     model = FLDD(
         vocab_size=vocab_size,      # Binary images
         num_timesteps=num_timesteps,  # Few-step generation
-        input_layer=input_layer,
-        hidden_dim=hidden_dim,
+        hidden_dim=128,
         time_dim=128
     )
     

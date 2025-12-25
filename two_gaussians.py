@@ -19,7 +19,10 @@ class TwoGaussians(Dataset):
         return self.dataset.shape[0]
 
     def __getitem__(self, idx):
-        return (idx, self.dataset[idx]) # For some reason MNIST returns this, so we have to too
+        dummy_label = idx   # Our code works with datasets where datapoints have labels, like MNIST
+                            # We don't have labels here, but to be compatible with other code, we invent one
+                            # We discard it anyway before passing it to the ML-model
+        return (self.dataset[idx], dummy_label)
 
 if __name__ == '__main__':
     first_gaussian_mean = [15, 15]
@@ -62,7 +65,7 @@ if __name__ == '__main__':
 
     heatmap = np.zeros(shape = (50, 50))
 
-    for x, y in dataset:
+    for _, (x, y) in dataset:
         heatmap[int(x), int(y)] += 1.0
     heatmap = heatmap / heatmap.max()
 
