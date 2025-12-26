@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from dask.array import shape
+from distributed.diagnostics.plugin import forward_stream
 from torch.distributions import Categorical, RelaxedOneHotCategorical
 import numpy as np
 from torchvision import datasets, transforms
@@ -97,9 +98,13 @@ class ResidualBlock(nn.Module):
 
 class FLDDTwoGaussians(nn.Module):
 
-    def __init__(self, input_dim = 2, vocab_size = 50, time_dim = 10, hidden_dim = 20):
+    def __init__(self, input_dim = 2, vocab_size = 50):
         super().__init__()
+        self.input_dim = input_dim
+        time_dim = 20
+        hidden_dim = 100  # time_dim and hidden_dim are analogues to the ones in FLDDNetwork right now. Might delete
         self.vocab_size = vocab_size
+
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_dim),
             nn.Linear(time_dim, time_dim),
@@ -119,14 +124,17 @@ class FLDDTwoGaussians(nn.Module):
     def forward(self, x, time):
         if x.dim() == 4:
             # Convert soft one-hot/probabilities back to expected coordinate values
-            # Using expectation or argmax to get a [Batch, 2] vector
+            # Using expectation or argmax to get a [Batch, input_dim] vector
             new_x = torch.argmax(x, dim=1).squeeze(-1).float()
+        elif x.dim() == 3:
+            # Case B: Sampler 'discrete' indices [B, input_dim, 1]
+            new_x = x.squeeze(-1).float()
         else:
             new_x = x.float()
         time_emb = self.time_mlp(time.float())
-        h = self.concatenator((new_x, time_emb))
+        h = self.concatenator((new_x, time_emb), dim = 1)
         output = self.main_network(h)
-        logits = output.view(-1, 2, 1, self.vocab_size)
+        logits = output.view(-1, self.input_dim, 1, self.vocab_size)
         return logits
 
 class FLDDNetwork(nn.Module):
@@ -423,7 +431,7 @@ class FLDD:
     3. Two-phase training: Concrete warm-up → REINFORCE
     """
     
-    def __init__(self, vocab_size=2, num_timesteps=10, hidden_dim=128, time_dim=128):
+    def __init__(self, vocab_size, num_timesteps, forward_net, reverse_net):
         """
         Args:
             vocab_size: Number of discrete values (2 for binary MNIST)
@@ -439,10 +447,10 @@ class FLDD:
         # Networks
         # =====================================================================
         # Forward network: takes x (data), outputs u_φ(x, t) for q_φ(z_t|x)
-        self.forward_net = FLDDNetwork(vocab_size, time_dim, hidden_dim).to(device)
+        self.forward_net = forward_net
         
         # Reverse network: takes z_t, outputs v_θ(z_t, t) for p_θ(z_s|z_t)
-        self.reverse_net = FLDDNetwork(vocab_size, time_dim, hidden_dim).to(device)
+        self.reverse_net = reverse_net
         
         # =====================================================================
         # Optimizer (AdamW with lr=2e-4 as in paper Appendix A)
@@ -493,12 +501,19 @@ class FLDD:
             # Boundary: q(z_0|x) = δ(z_0 - x)
             # One-hot encoding of x
             probs = F.one_hot(x.long(), self.vocab_size).float()
+            if x.dim() == 2:  # For TwoGaussians
+                probs = probs.unsqueeze(2)
             return probs
             
         elif t == self.num_timesteps:
             # Boundary: q(z_T|x) = p(z_T) = uniform
-            probs = torch.ones(batch_size, x.shape[1], x.shape[2], 
-                              self.vocab_size, device=self.device) / self.vocab_size
+            probs = torch.ones(
+                batch_size,
+                x.shape[1],
+                x.shape[2] if x.dim() == 3 else 1, # If x is one-dim, we add a dummy dimension for consistency
+                self.vocab_size,
+                device=self.device
+            ) / self.vocab_size
             return probs
             
         else:
@@ -516,6 +531,8 @@ class FLDD:
             
             # One-hot of original data
             x_onehot = F.one_hot(x.long(), self.vocab_size).float()
+            if x.dim() == 2:  # For TwoGaussians
+                x_onehot = x_onehot.unsqueeze(2)
             
             # Uniform distribution
             uniform = torch.ones_like(net_probs) / self.vocab_size
@@ -614,12 +631,16 @@ class FLDD:
             u_s_given_t = F.one_hot(x.long(), self.vocab_size).float()
         else:
             u_s_given_t = MaximumCoupling.compute_posterior_soft(u_s, u_t, z_t_soft)
+        if u_s_given_t.dim() == 3:
+            u_s_given_t = u_s_given_t.unsqueeze(2)
         
         # Get reverse distribution p_θ(z_s | z_t)
         # Convert soft samples to [batch, vocab, H, W] for network input
         z_t_input = z_t_soft.permute(0, 3, 1, 2)
         v_s_given_t = self.get_reverse_distribution(z_t_input, t)
-        
+
+        if u_s_given_t.shape != v_s_given_t.shape:
+            print(f"Shapes are {u_s_given_t.shape}, {v_s_given_t.shape}")
         # Compute KL divergence loss
         kl_loss = self.compute_kl_divergence(u_s_given_t, v_s_given_t).mean()
         
@@ -662,7 +683,7 @@ class FLDD:
         # Log probability for REINFORCE
         # Sum over all spatial positions since we sample independently
         log_prob_z_t = dist.log_prob(z_t)  # [batch, H, W]
-        log_prob_sum = log_prob_z_t.sum(dim=[1, 2])  # [batch]
+        log_prob_sum = log_prob_z_t.view(log_prob_z_t.size(0), -1).sum(dim=1)  # [batch]
         
         # Compute posterior q(z_s | z_t, x)
         if s == 0:
@@ -675,7 +696,7 @@ class FLDD:
         
         # Compute KL divergence
         kl_per_position = self.compute_kl_divergence(u_s_given_t, v_s_given_t)  # [batch, H, W]
-        kl_per_sample = kl_per_position.sum(dim=[1, 2])  # [batch]
+        kl_per_sample = kl_per_position.view(kl_per_position.size(0), -1).sum(dim=1)  # [batch]
         kl_loss = kl_per_sample.mean()
         
         # REINFORCE gradient (Equation 13)
@@ -731,7 +752,7 @@ class FLDD:
         return loss.item()
     
     @torch.no_grad()
-    def sample(self, num_samples=16, image_size=28):
+    def sample(self, num_samples=16, sample_shape = (28, 28)):
         """
         Sampling procedure (Algorithm 2).
         
@@ -747,10 +768,10 @@ class FLDD:
         """
         self.forward_net.eval()
         self.reverse_net.eval()
-        
+
         # Sample z_T from prior p(z_T) = uniform
-        z_t = torch.randint(0, self.vocab_size, (num_samples, image_size, image_size), 
-                           device=self.device)
+        tensor_shape = (num_samples, *sample_shape)
+        z_t = torch.randint(0, self.vocab_size, tensor_shape, device=self.device)
         
         # Reverse diffusion: t = T, T-1, ..., 1
         for t in reversed(range(1, self.num_timesteps + 1)):
@@ -899,8 +920,10 @@ def train_model(model, train_loader, num_epochs=None):
 def visualize_samples(model, epoch, save_dir='./outputs'):
     """Generate and save sample images."""
     os.makedirs(save_dir, exist_ok=True)
-    
-    samples = model.sample(num_samples=16)
+
+    # TODO: This is an ugly hack. We need to make our code shape independent
+    sample_shape = (2, 1) if model.vocab_size == 50 else (28, 28)
+    samples = model.sample(num_samples = 16, sample_shape = sample_shape)
     
     fig, axes = plt.subplots(4, 4, figsize=(8, 8))
     for i, ax in enumerate(axes.flat):
@@ -977,17 +1000,32 @@ def main():
     os.makedirs('./outputs', exist_ok=True)
 
     # Prepare data
-    dataset_name = "MNIST"
+    dataset_name = "TwoGaussians"
     train_loader, test_loader = prepare_data(dataset=dataset_name, batch_size=128)
     
     # Initialize model
     # Using T=10 as in paper experiments for few-step generation
     vocab_size, num_timesteps = (2, 10) if dataset_name == "MNIST" else (50, 2)
+    if dataset_name == "MNIST":
+        vocab_size = 2
+        num_timesteps = 10
+        hidden_dim = 128
+        time_dim = 128
+        forward_nn_model = FLDDNetwork(vocab_size, time_dim, hidden_dim).to(device)
+        reverse_nn_model = FLDDNetwork(vocab_size, time_dim, hidden_dim).to(device)
+    elif dataset_name == "TwoGaussians":
+        vocab_size = 50
+        num_timesteps = 2
+        forward_nn_model = FLDDTwoGaussians(vocab_size = vocab_size).to(device)
+        reverse_nn_model = FLDDTwoGaussians(vocab_size = vocab_size).to(device)
+    else:
+        raise Exception("Invalid or unknown dataset name")
+
     model = FLDD(
         vocab_size=vocab_size,      # Binary images
         num_timesteps=num_timesteps,  # Few-step generation
-        hidden_dim=128,
-        time_dim=128
+        forward_net=forward_nn_model,
+        reverse_net=reverse_nn_model
     )
     
     print(f"\nModel Configuration:")
@@ -1007,7 +1045,7 @@ def main():
     print("=" * 60)
     
     # Train model
-    losses = train_model(model, train_loader, num_epochs = None)
+    losses = train_model(model, train_loader, num_epochs = 30)
     
     # Plot training curve
     plt.figure(figsize=(10, 4))
@@ -1021,7 +1059,28 @@ def main():
     plt.tight_layout()
     plt.savefig('./outputs/training_curve.png', dpi=150)
     plt.close()
-    
+
+    if dataset_name == "TwoGaussians":
+        samples = model.sample(num_samples = 1000, sample_shape=(2, 1)).squeeze(-1).cpu().numpy()
+        heatmap = np.zeros(shape=(50, 50))
+        for i in range(samples.shape[0]):
+            x = samples[i, 0]
+            y = samples[i, 1]
+            if 0 <= x < 50 and 0 <= y < 50:
+                heatmap[x, y] += 1.0
+            else:
+                print("Invalid Coordinates: " + str(x) + ", " + str(y))
+        heatmap = heatmap / heatmap.max()
+        plt.imshow(
+            heatmap,
+            cmap="viridis",
+            origin="lower"
+        )
+        plt.savefig('./outputs/gaussian_samples.png')
+        plt.show()
+        import sys
+        sys.exit(0)
+
     # Visualize diffusion process
     visualize_diffusion_process(model, test_loader)
     

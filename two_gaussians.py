@@ -8,11 +8,14 @@ from pathlib import Path
 # Run this file to generate the gaussians
 # =============================================================================
 
-dataset_size = 6000
+dataset_size = 10000
+dataset_folder = "./data/two_gaussians"
+dataset_name = "dataset.pt"
+dataset_path = dataset_folder + "/" + dataset_name
 
 class TwoGaussians(Dataset):
     def __init__(self):
-        self.dataset = torch.load("./data/two_gaussians/dataset.pt")
+        self.dataset = torch.load(dataset_path)
         super().__init__()
 
     def __len__(self):
@@ -22,6 +25,7 @@ class TwoGaussians(Dataset):
         dummy_label = idx   # Our code works with datasets where datapoints have labels, like MNIST
                             # We don't have labels here, but to be compatible with other code, we invent one
                             # We discard it anyway before passing it to the ML-model
+                            # Using the index might be useful for debugging
         return (self.dataset[idx], dummy_label)
 
 if __name__ == '__main__':
@@ -46,7 +50,7 @@ if __name__ == '__main__':
         samples_generated = 0
         while samples_generated < num_samples:
             x = naive_gaussian_mixture()
-            if 1.0 <= x[0] <= 50.0 and 1.0 <= x[1] <= 50.0:
+            if 0.0 <= x[0] <= 49.0 and 0.0 <= x[1] <= 49.0:
                 samples[samples_generated, 0] = x[0]
                 samples[samples_generated, 1] = x[1]
                 samples_generated += 1
@@ -56,8 +60,8 @@ if __name__ == '__main__':
     dataset = torch.tensor(generate_samples(dataset_size))
 
     print("Saving...")
-    Path("./data/two_gaussians").mkdir(parents=True, exist_ok=True)
-    torch.save(dataset, './data/two_gaussians/dataset.pt')
+    Path(dataset_folder).mkdir(parents=True, exist_ok=True)
+    torch.save(dataset, dataset_path)
 
     dataset = TwoGaussians()
     print("Length of dataset: ", dataset.__len__())
@@ -65,7 +69,7 @@ if __name__ == '__main__':
 
     heatmap = np.zeros(shape = (50, 50))
 
-    for _, (x, y) in dataset:
+    for (x, y), _ in dataset:
         heatmap[int(x), int(y)] += 1.0
     heatmap = heatmap / heatmap.max()
 
