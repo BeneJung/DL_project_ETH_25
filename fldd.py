@@ -727,7 +727,7 @@ class FLDD:
         else:
             u_s_given_t = self.transport_plan.compute_posterior(u_s, u_t, z_t)
         if u_s_given_t.dim() == 3:
-                    u_s_given_t = u_s_given_t.unsqueeze(2)
+            u_s_given_t = u_s_given_t.unsqueeze(2)
         # Get reverse distribution p_θ(z_s | z_t)
         v_s_given_t = self.get_reverse_distribution(z_t, t)
 

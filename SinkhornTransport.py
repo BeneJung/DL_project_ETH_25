@@ -3,6 +3,7 @@ import numpy as np
 import time
 import ot
 import os
+import matplotlib.pyplot as plt
 
 from fldd import *
 
@@ -22,6 +23,7 @@ class SinkhornTransportModel:
 
     def __init__(self, vocab, lam=1, threshold=5e-7, C=None):
         # Default: C_{u,v} = 1_{u\neq v}
+        print("Using Sinkhorn Transport")
         if C is not None:
             self.C = C
             assert self.C.shape[-2:] == (vocab, vocab)
@@ -43,7 +45,7 @@ class SinkhornTransportModel:
           P: optimal transport matrix of shape (K, K), res[r, c] = q_(z_s = r, z_t = s)
           err: Error
         """
-        print("Using Sinkhorn Transport")
+
         ndim = a.ndim
         eps = 1e-8
         P: torch.Tensor = torch.exp(-self.C / self.lam)
@@ -202,7 +204,8 @@ def main():
 
     # Initialize model
     # Using T=10 as in paper experiments for few-step generation
-    vocab_size, num_timesteps = (2, 10) if dataset_name == "MNIST" else (50, 10)
+    vocab_size, num_timesteps = (
+        2, 10) if dataset_name == "MNIST" else (50, 10)
     if dataset_name == "MNIST":
         vocab_size = 2
         num_timesteps = 10
@@ -220,12 +223,13 @@ def main():
     else:
         raise Exception("Invalid or unknown dataset name")
 
+    transport = "maximum"
     model = FLDD(
         vocab_size=vocab_size,      # Binary images
         num_timesteps=num_timesteps,  # Few-step generation
         forward_net=forward_nn_model,
         reverse_net=reverse_nn_model,
-        transportplan="maximum",
+        transportplan=transport,
         warmup_steps=1000
     )
 
@@ -246,7 +250,7 @@ def main():
     print("=" * 60)
 
     # Train model
-    losses = train_model(model, train_loader, num_epochs=50)
+    losses = train_model(model, train_loader, num_epochs=30)
 
     # Plot training curve
     plt.figure(figsize=(10, 4))
@@ -259,9 +263,8 @@ def main():
     plt.title('FLDD Training Loss')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('./outputs/training_curve.png', dpi=150)
+    plt.savefig(f'./outputs/training_curve_{transport}.png', dpi=150)
     plt.close()
-    exit()
 
     if dataset_name == "TwoGaussians":
         samples = model.sample(num_samples=1000, sample_shape=(
@@ -280,7 +283,7 @@ def main():
             cmap="viridis",
             origin="lower"
         )
-        plt.savefig('./outputs/gaussian_samples.png')
+        plt.savefig(f'./outputs/gaussian_samples_{transport}.png')
         plt.show()
         import sys
         sys.exit(0)
