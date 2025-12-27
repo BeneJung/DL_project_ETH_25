@@ -1,0 +1,6 @@
+.DS_Store
+.vscode/
+DL_project/
+__pycache__/
+data/
+outputs/
