@@ -438,13 +438,12 @@ class FLDD:
         """
         Get q_φ(z_t | x) - the forward marginal distribution.
         
-        Boundary conditions (enforced directly, not via interpolation):
+        This is parameterized by the forward network, with boundary conditions:
         - t = 0: q(z_0|x) = δ(z_0 - x)  (deterministic = original data)
         - t = T: q(z_T|x) = p(z_T)      (uniform prior)
         
-        For intermediate t, the network has FULL FREEDOM to learn any distribution.
-        This is the key to FLDD: the forward process learns data-dependent
-        corruption patterns that make the reverse task easier.
+        For intermediate t, we use the network output with interpolation
+        to ensure smooth boundaries.
         
         Args:
             x: [batch, H, W] - original discrete data
@@ -458,19 +457,46 @@ class FLDD:
         if t == 0:
             # Boundary: q(z_0|x) = δ(z_0 - x)
             # One-hot encoding of x
-            return F.one_hot(x.long(), self.vocab_size).float()
+            probs = F.one_hot(x.long(), self.vocab_size).float()
+            return probs
             
         elif t == self.num_timesteps:
             # Boundary: q(z_T|x) = p(z_T) = uniform
-            return torch.ones(batch_size, x.shape[1], x.shape[2], 
-                            self.vocab_size, device=self.device) / self.vocab_size
+            probs = torch.ones(batch_size, x.shape[1], x.shape[2], 
+                              self.vocab_size, device=self.device) / self.vocab_size
+            return probs
             
         else:
-            # Intermediate: network has FULL CONTROL (no interpolation!)
-            # This allows FLDD to learn non-trivial corruption patterns
+            # Intermediate: use network with boundary interpolation
             t_tensor = torch.full((batch_size,), t, device=self.device)
             logits = self.forward_net(x, t_tensor)
-            return F.softmax(logits, dim=-1)
+            
+            # Softmax to get base probabilities
+            net_probs = F.softmax(logits, dim=-1)
+            
+            # Interpolate with boundaries for smooth transitions
+            # As t increases: move from data (one-hot) toward uniform
+            # This ensures the network respects boundary conditions
+            alpha = t / self.num_timesteps  # 0 at t=0, 1 at t=T
+            
+            # One-hot of original data
+            x_onehot = F.one_hot(x.long(), self.vocab_size).float()
+            
+            # Uniform distribution
+            uniform = torch.ones_like(net_probs) / self.vocab_size
+            
+            # Interpolation scheme:
+            # - Network output is blended between data and uniform
+            # - Early timesteps (small alpha): closer to data
+            # - Late timesteps (large alpha): closer to uniform
+            # We let the network modulate the interpolation
+            probs = (1 - alpha) * ((1 - alpha) * x_onehot + alpha * net_probs) + \
+                    alpha * ((1 - alpha) * net_probs + alpha * uniform)
+            
+            # Ensure valid probability distribution
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+            
+            return probs
     
     def get_reverse_distribution(self, z_t, t):
         """
@@ -548,9 +574,12 @@ class FLDD:
         dist = RelaxedOneHotCategorical(self.temperature, probs=u_t + 1e-8)
         z_t_soft = dist.rsample()  # [batch, H, W, vocab]
         
-        # When s=0, u_s is one-hot (from get_forward_marginals), and the coupling
-        # will correctly produce a one-hot posterior
-        u_s_given_t = MaximumCoupling.compute_posterior_soft(u_s, u_t, z_t_soft)
+        # Compute soft posterior q(z_s | z̄_t, x)
+        if s == 0:
+            # At s=0, posterior should reconstruct x exactly
+            u_s_given_t = F.one_hot(x.long(), self.vocab_size).float()
+        else:
+            u_s_given_t = MaximumCoupling.compute_posterior_soft(u_s, u_t, z_t_soft)
         
         # Get reverse distribution p_θ(z_s | z_t)
         # Convert soft samples to [batch, vocab, H, W] for network input
@@ -601,8 +630,11 @@ class FLDD:
         log_prob_z_t = dist.log_prob(z_t)  # [batch, H, W]
         log_prob_sum = log_prob_z_t.sum(dim=[1, 2])  # [batch]
         
-        #compute posterior q(z_s | z_t, x)
-        u_s_given_t = MaximumCoupling.compute_posterior(u_s, u_t, z_t)
+        # Compute posterior q(z_s | z_t, x)
+        if s == 0:
+            u_s_given_t = F.one_hot(x.long(), self.vocab_size).float()
+        else:
+            u_s_given_t = MaximumCoupling.compute_posterior(u_s, u_t, z_t)
         
         # Get reverse distribution p_θ(z_s | z_t)
         v_s_given_t = self.get_reverse_distribution(z_t, t)
