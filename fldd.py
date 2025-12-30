@@ -30,8 +30,6 @@ from two_gaussians import TwoGaussians
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-
 
 # =============================================================================
 # NEURAL NETWORK COMPONENTS
@@ -108,13 +106,17 @@ class FLDDTwoGaussians(nn.Module):
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(time_dim),
             nn.Linear(time_dim, time_dim),
-            nn.ReLU()
+            nn.ReLU(),
+        )
+        self.x_mlp = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.ReLU(),
         )
         self.concatenator = torch.cat
         # Now we infer for each input dimension and discrete value from the vocab the "probability" (logit to be exact)
         # that this dimension has that discrete value. Hence the output vector has size input_dim * vocab_size
         self.main_network = nn.Sequential(
-            nn.Linear(2 + time_dim, hidden_dim),
+            nn.Linear(hidden_dim + time_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -125,14 +127,15 @@ class FLDDTwoGaussians(nn.Module):
         if x.dim() == 4:
             # Convert soft one-hot/probabilities back to expected coordinate values
             # Using expectation or argmax to get a [Batch, input_dim] vector
-            new_x = torch.argmax(x, dim=1).squeeze(-1).float()
+            x_reshaped = torch.argmax(x, dim=1).squeeze(-1).float()
         elif x.dim() == 3:
             # Case B: Sampler 'discrete' indices [B, input_dim, 1]
-            new_x = x.squeeze(-1).float()
+            x_reshaped = x.squeeze(-1).float()
         else:
-            new_x = x.float()
+            x_reshaped = x.float()
+        x_emb = self.x_mlp(x_reshaped)
         time_emb = self.time_mlp(time.float())
-        h = self.concatenator((new_x, time_emb), dim = 1)
+        h = self.concatenator((x_emb, time_emb), dim = 1)
         output = self.main_network(h)
         logits = output.view(-1, self.input_dim, 1, self.vocab_size)
         return logits
@@ -767,7 +770,7 @@ class FLDD:
         Returns:
             samples: [num_samples, H, W] discrete samples
         """
-        self.forward_net.eval()
+        self.forward_net.eval() # Turns off training. Will be turned on at the end of this function
         self.reverse_net.eval()
 
         # Sample z_T from prior p(z_T) = uniform
@@ -995,8 +998,8 @@ def main():
     print("=" * 60)
     print("Forward-Learned Discrete Diffusion (FLDD) - Corrected")
     print("=" * 60)
-    print(f"Device: {device}")
-    
+    print(f"Using device: {device}")
+
     # Create output directory
     os.makedirs('./outputs', exist_ok=True)
 
