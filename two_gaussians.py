@@ -46,13 +46,13 @@ if __name__ == '__main__':
             )
 
     def generate_samples(num_samples):
-        samples = np.ndarray(shape = (num_samples, 2))
+        samples = np.ndarray(shape = (num_samples, 2, 1))
         samples_generated = 0
         while samples_generated < num_samples:
             x = naive_gaussian_mixture()
             if 0.0 <= x[0] <= 49.0 and 0.0 <= x[1] <= 49.0:
-                samples[samples_generated, 0] = x[0]
-                samples[samples_generated, 1] = x[1]
+                samples[samples_generated, 0, 0] = x[0]
+                samples[samples_generated, 1, 0] = x[1]
                 samples_generated += 1
         return samples
 
@@ -69,7 +69,9 @@ if __name__ == '__main__':
 
     heatmap = np.zeros(shape = (50, 50))
 
-    for (x, y), _ in dataset:
+    for datapoint, _ in dataset:
+        x = datapoint[0, 0]
+        y = datapoint[1, 0]
         heatmap[int(x), int(y)] += 1.0
     heatmap = heatmap / heatmap.max()
 
