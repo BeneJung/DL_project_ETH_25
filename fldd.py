@@ -456,7 +456,7 @@ class FLDD:
     """
 
     def __init__(self, vocab_size, num_timesteps, forward_net, reverse_net,
-                 transportplan: str = "maximum", warmup_steps=50000):
+                 transportplan: str = "maximum", warmup_steps=50000, tc_weight=0):
         """
         Args:
             vocab_size: Number of discrete values (2 for binary MNIST)
@@ -512,7 +512,7 @@ class FLDD:
         self.min_temperature = 1e-3
         self.temp_decay_rate = (self.min_temperature /
                                 1.0) ** (1.0 / self.warmup_steps)
-
+        self.tc_weight = tc_weight
         # For logging
         self.losses = []
 
@@ -640,6 +640,69 @@ class FLDD:
 
         return kl.sum(dim=-1)
 
+    def estimate_tc_mws(self, posterior_probs, z_samples):
+        """
+        Estimates Total Correlation (TC) using Minibatch Weighted Sampling (MWS).
+        
+        Calculates KL( q(z_s|z_t) || prod_d q(z_s^d|z_t) ) where q(z_s|z_t) is the 
+        aggregated posterior approximated by the minibatch.
+        
+        Formula from Chen et al. (Beta-TCVAE):
+        E_q(z) [ log q(z) - sum_d log q(z_d) ]
+        
+        Args:
+            posterior_probs: [Batch, H, W, Vocab] - Parameters of q(z_s | z_t, x_n) for each n
+            z_samples: [Batch, H, W] - Discrete samples drawn from posterior_probs
+            
+        Returns:
+            tc_estimate: Scalar tensor approximating the Total Correlation.
+        """
+        B, H, W, V = posterior_probs.shape
+        
+        # 1. Compute log probabilities of the samples under ALL distributions in the batch
+        # We need log q(z_sample_i | x_j) for all i, j.
+        # This requires broadcasting:
+        # posterior_probs: [1, B, H, W, V] (distributions)
+        # z_samples:       [B, 1, H, W]    (samples)
+        
+        probs_expanded = posterior_probs.unsqueeze(0).expand(B, -1, -1, -1, -1)  # [1, B, H, W, V]
+        z_expanded = z_samples.unsqueeze(1).unsqueeze(-1) # [B, 1, H, W, 1] for gather
+        
+        # Gather probabilities of the sampled classes
+        # gathered_probs[i, j, h, w] = prob of sample i's pixel at (h,w) under posterior j
+        gathered_probs = torch.gather(probs_expanded, -1, z_expanded.expand(B, B, H, W, 1)).squeeze(-1) # [B, B, H, W]
+        
+        # Sum over spatial dimensions (H, W) to get log prob of the full latent state
+        # log_prob_matrix[i, j] = log q(z_i | z_t, x_j)
+        log_prob_matrix = torch.log(gathered_probs + 1e-10).sum(dim=(2, 3)) # [B, B]
+        
+        # 2. Estimate log q(z_s | z_t) (Aggregated Posterior)
+        # q(z) = 1/B * sum_j q(z|x_j)
+        # log q(z_i) = log(1/B) + logsumexp_j( log q(z_i|x_j) )
+        log_q_z = torch.logsumexp(log_prob_matrix, dim=1) - torch.log(torch.tensor(B, dtype=torch.float32, device=self.device))
+
+        # 3. Estimate log prod_d q(z_s^d | z_t) (Product of Marginals)
+        # First, compute marginals averaged over batch: q_bar(z^d) = 1/B sum_j q(z^d | x_j)
+        # posterior_probs: [B, H, W, V] -> mean over dim 0 -> [H, W, V]
+        marginal_probs = posterior_probs.mean(dim=0) # [H, W, V]
+        
+        # Now compute log prob of samples under these marginals
+        # z_samples: [B, H, W]
+        z_samples_long = z_samples.long().unsqueeze(-1) # [B, H, W, 1]
+        
+        # Gather marginal probabilities for the specific samples
+        gathered_marginals = torch.gather(marginal_probs.unsqueeze(0).expand(B, H, W, V), -1, z_samples_long).squeeze(-1) # [B, H, W]
+        
+        # Sum log probs over dimensions
+        # log_prod_marginals[i] = sum_d log q_bar(z_i^d)
+        log_prod_marginals = torch.log(gathered_marginals + 1e-10).sum(dim=(1, 2)) # [B]
+        
+        # 4. Compute TC
+        # TC = E [ log q(z) - log prod q(z_d) ]
+        tc_estimate = (log_q_z - log_prod_marginals).mean()
+        
+        return tc_estimate
+    
     def warmup_step(self, x):
         """
         Relaxed optimization step using Concrete distribution (Section 3.3).
@@ -691,8 +754,27 @@ class FLDD:
             prior_loss = self.compute_kl_divergence(u_t, prior).mean()
             kl_loss = kl_loss + 0.1 * prior_loss
 
-        return kl_loss
-
+        # =====================================================================
+        # TC REGULARIZATION (New)
+        # =====================================================================
+        # Even though we are in warmup (soft), MWS requires discrete samples to 
+        # index the probability matrices efficiently. We sample from the 
+        # current posterior u_s_given_t specifically for the TC estimator.
+        # This acts as a Monte Carlo estimate of the TC.
+        if self.tc_weight > 0 and s > 0:
+            # Sample hard z_s for MWS estimation
+            with torch.no_grad():
+                z_s_hard = Categorical(probs=u_s_given_t).sample()
+            
+            tc_loss = self.estimate_tc_mws(u_s_given_t, z_s_hard)
+            total_loss = kl_loss + self.tc_weight * tc_loss
+            print("TC: ", tc_loss)
+        else:
+            total_loss = kl_loss
+        
+        
+        return total_loss
+    
     def reinforce_step(self, x):
         """
         REINFORCE training step with discrete samples (Algorithm 1).
@@ -758,7 +840,25 @@ class FLDD:
             prior = torch.ones_like(u_t) / self.vocab_size
             prior_loss = self.compute_kl_divergence(u_t, prior).mean()
             total_loss = total_loss + 0.1 * prior_loss
-
+        
+        # =====================================================================
+        # TC REGULARIZATION (New)
+        # =====================================================================
+        if self.tc_weight > 0 and s > 0:
+            # We need samples z_s to estimate TC.
+            # We can sample from u_s_given_t directly.
+            # Note: We detach these samples so we don't differentiate through sampling
+            # (although MWS usually operates on the probabilities themselves)
+            z_s_sampled = Categorical(probs=u_s_given_t).sample()
+            
+            # The TC loss is differentiable wrt u_s_given_t (and thus phi)
+            tc_loss = self.estimate_tc_mws(u_s_given_t, z_s_sampled)
+            
+            total_loss = total_loss + self.tc_weight * tc_loss
+            print("TC: ", tc_loss)
+        else:
+            total_loss = total_loss
+        
         return total_loss
 
     def train_step(self, x):
@@ -1138,7 +1238,8 @@ def main():
         vocab_size=vocab_size,      # Binary images
         num_timesteps=num_timesteps,  # Few-step generation
         forward_net=forward_nn_model,
-        reverse_net=reverse_nn_model
+        reverse_net=reverse_nn_model,
+        tc_weight=1e-2
     )
 
     print(f"\nModel Configuration:")
