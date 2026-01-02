@@ -38,3 +38,4 @@ tqdm==4.67.1
 typing_extensions==4.15.0
 urllib3==2.6.2
 zict==3.0.0
+torchmetrics[image]==1.6.1

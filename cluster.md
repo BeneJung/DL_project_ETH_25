@@ -20,5 +20,16 @@ After logging in the cluster:
 - running jobs
   ```bash
   cd DL_project
-  srun --pty -A deep_learning -t 120 python SinkhornTransport.py
+  srun --pty -A deep_learning -t 120 python3 SinkhornTransport.py
+  ```
+
+- clearing clash
+  ```bash
+  export 'PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True'
+  ```
+  ```python
+  def print_gpu_memory():
+    print(f"Allocated memory: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+    print(f"Cached memory: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+    torch.cuda.empty_cache()
   ```

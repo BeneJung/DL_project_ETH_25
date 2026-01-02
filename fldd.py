@@ -28,6 +28,7 @@ import os
 
 from two_gaussians import TwoGaussians
 from SinkhornTransport import SinkhornTransportModel
+from torchmetrics.image.fid import FrechetInceptionDistance
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -480,6 +481,9 @@ class FLDD:
             self.transport_plan = MaximumCoupling
         elif transportplan == "sinkhorn":
             self.transport_plan = SinkhornTransportModel(vocab_size)
+        elif transportplan == "sinkhorn_learnable":
+            self.transport_plan = SinkhornTransportModel(
+                vocab_size, learnable=True)
         else:
             raise ValueError("Unknown transport plan")
 
@@ -488,7 +492,9 @@ class FLDD:
         # =====================================================================
         self.optimizer = optim.AdamW(
             list(self.forward_net.parameters()) +
-            list(self.reverse_net.parameters()),
+            list(self.reverse_net.parameters()) +
+            list(self.transport_plan.parameters() if isinstance(
+                self.transport_plan, nn.Module) else []),
             lr=2e-4
         )
 
@@ -513,14 +519,14 @@ class FLDD:
     def get_forward_marginals(self, x, t):
         """
         Get q_φ(z_t | x) - the forward marginal distribution.
-        
+
         This is parameterized by the forward network, with boundary conditions:
         - t = 0: q(z_0|x) = δ(z_0 - x)  (deterministic = original data)
         - t = T: q(z_T|x) = p(z_T)      (uniform prior)
-        
+
         For intermediate t, we use the network output with interpolation
         to ensure smooth boundaries.
-        
+
         Args:
             x: [batch, H, W] - original discrete data
             t: int - timestep (0 to T)
@@ -904,11 +910,19 @@ def prepare_data(dataset="MNIST", batch_size=128):
 # TRAINING
 # =============================================================================
 
-def train_model(model, train_loader, num_epochs=None):
+def train_model(model: FLDD, train_loader, dataset, num_epochs=None):
     """
     Training loop following paper specifications.
     """
     losses = []
+
+    # Initialize FID metric only for image datasets
+    fid = None
+    max_fid_samples = 2048  # Limit samples for FID to save memory
+    if dataset == "MNIST":
+        fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+        f = open(
+            f"outputs/mnist_fid_{model.transport_plan.__name__}{'learnable' if isinstance(model.transport_plan, SinkhornTransportModel) else 'fixed'}.csv", "w")
 
     # Calculate epochs based on total steps
     steps_per_epoch = len(train_loader)
@@ -925,6 +939,8 @@ def train_model(model, train_loader, num_epochs=None):
 
     for epoch in range(total_epochs):
         epoch_losses = []
+        real_images = []
+        total_samples = 0
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{total_epochs}')
 
         # TODO: think about whether we should train in batches or, as in the paper, with single datapoints
@@ -938,6 +954,14 @@ def train_model(model, train_loader, num_epochs=None):
             # Training step
             loss = model.train_step(data)
             epoch_losses.append(loss)
+
+            # Accumulate real images for FID (only for MNIST)
+            if fid is not None and total_samples < max_fid_samples:
+                # Convert grayscale to RGB
+                # [batch, 1, H, W] -> [batch, 3, H, W]
+                real_rgb = data.unsqueeze(1).repeat(1, 3, 1, 1)
+                real_images.append(real_rgb)
+                total_samples += data.shape[0]
 
             # Update progress bar
             if batch_idx % 20 == 0:
@@ -953,18 +977,50 @@ def train_model(model, train_loader, num_epochs=None):
         avg_loss = np.mean(epoch_losses) if epoch_losses else 0
         losses.append(avg_loss)
         print(f'Epoch {epoch+1}: Avg Loss = {avg_loss:.4f}')
+        if isinstance(model.transport_plan, SinkhornTransportModel):
+            print("Transport Plan Parameters:")
+            for name, param in model.transport_plan.named_parameters():
+                print(f"  {name}: {param}")
 
         # Generate samples periodically
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            visualize_samples(model, epoch + 1)
+            visualize_samples(model, epoch + 1, "")
+
+            # Compute FID only for image datasets like MNIST
+            if dataset == "MNIST" and real_images:
+                # Concatenate all real images from this epoch
+                real_batch = torch.cat(real_images, dim=0)
+                fid.update(real_batch, real=True)  # type:ignore
+
+                # Generate fake images (same number as real) in batches to save memory
+                num_samples = real_batch.shape[0]
+                sample_shape = (28, 28)
+                batch_size = 128
+                fake_samples_list = []
+                for i in range(0, num_samples, batch_size):
+                    batch_num = min(batch_size, num_samples - i)
+                    fake_batch = model.sample(
+                        num_samples=batch_num, sample_shape=sample_shape)
+                    fake_samples_list.append(fake_batch)
+                fake_samples = torch.cat(fake_samples_list, dim=0)
+                fake_rgb = fake_samples.unsqueeze(1).repeat(1, 3, 1, 1)
+                fid.update(fake_rgb, real=False)  # type:ignore
+
+                fid_score = fid.compute()  # type:ignore
+                print(f'Epoch {epoch+1}: FID = {fid_score:.4f}')
+                f.write(f'{epoch}, {fid_score:.4f}\n')  # type:ignore
+                fid.reset()  # Reset for next computation # type:ignore
 
         if model.current_step >= model.total_steps:
             break
 
+    if dataset == "MNIST":
+        f.close()  # type:ignore
+
     return losses
 
 
-def visualize_samples(model, epoch, save_dir='./outputs'):
+def visualize_samples(model: FLDD, epoch, dataset, save_dir='./outputs'):
     """Generate and save sample images."""
     os.makedirs(save_dir, exist_ok=True)
 
@@ -981,12 +1037,13 @@ def visualize_samples(model, epoch, save_dir='./outputs'):
     plt.suptitle(
         f'FLDD Samples - Epoch {epoch} ({phase}, step {model.current_step})')
     plt.tight_layout()
-    plt.savefig(f'{save_dir}/samples_epoch_{epoch}.png', dpi=150)
+    plt.savefig(f'{save_dir}/samples_epoch_{dataset}_{epoch}.png', dpi=150)
     plt.close()
-    print(f"  → Saved samples to {save_dir}/samples_epoch_{epoch}.png")
+    print(
+        f"  → Saved samples to {save_dir}/samples_epoch_{dataset}_{epoch}.png")
 
 
-def visualize_diffusion_process(model, test_loader, save_dir='./outputs'):
+def visualize_diffusion_process(model, test_loader, dataset, save_dir='./outputs'):
     """Visualize forward and reverse processes."""
     print("VISUALIZE DIFFUSION PROCESS")
     os.makedirs(save_dir, exist_ok=True)
@@ -1033,15 +1090,14 @@ def visualize_diffusion_process(model, test_loader, save_dir='./outputs'):
     plt.suptitle(
         f'FLDD: Learned Forward and Reverse Processes (T={model.num_timesteps})')
     plt.tight_layout()
-    plt.savefig(f'{save_dir}/diffusion_process.png', dpi=150)
+    plt.savefig(f'{save_dir}/{dataset}_diffusion_process.png', dpi=150)
     plt.close()
     print(
-        f"  → Saved diffusion process visualization to {save_dir}/diffusion_process.png")
-
-
+        f"  → Saved diffusion process visualization to {save_dir}/{dataset}_diffusion_process.png")
 # =============================================================================
 # MAIN
 # =============================================================================
+
 
 def main():
     """Main training script."""
@@ -1102,7 +1158,7 @@ def main():
     print("=" * 60)
 
     # Train model
-    losses = train_model(model, train_loader, num_epochs=30)
+    losses = train_model(model, train_loader, dataset_name, num_epochs=30)
 
     # Plot training curve
     plt.figure(figsize=(10, 4))
@@ -1141,7 +1197,7 @@ def main():
         sys.exit(0)
 
     # Visualize diffusion process
-    visualize_diffusion_process(model, test_loader)
+    visualize_diffusion_process(model, test_loader, dataset_name)
 
     # Generate final samples
     print("\nGenerating final samples...")
