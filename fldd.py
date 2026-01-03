@@ -27,7 +27,7 @@ import math
 import os
 
 from two_gaussians import TwoGaussians
-from SinkhornTransport import SinkhornTransportModel
+
 from torchmetrics.image.fid import FrechetInceptionDistance
 
 # Set device
@@ -476,7 +476,7 @@ class FLDD:
 
         # Reverse network: takes z_t, outputs v_θ(z_t, t) for p_θ(z_s|z_t)
         self.reverse_net = reverse_net
-
+        from SinkhornTransport import SinkhornTransportModel
         if transportplan == "maximum":
             self.transport_plan = MaximumCoupling
         elif transportplan == "sinkhorn":
@@ -768,7 +768,6 @@ class FLDD:
             
             tc_loss = self.estimate_tc_mws(u_s_given_t, z_s_hard)
             total_loss = kl_loss + self.tc_weight * tc_loss
-            print("TC: ", tc_loss)
         else:
             total_loss = kl_loss
         
@@ -855,7 +854,6 @@ class FLDD:
             tc_loss = self.estimate_tc_mws(u_s_given_t, z_s_sampled)
             
             total_loss = total_loss + self.tc_weight * tc_loss
-            print("TC: ", tc_loss)
         else:
             total_loss = total_loss
         
@@ -1010,7 +1008,7 @@ def prepare_data(dataset="MNIST", batch_size=128):
 # TRAINING
 # =============================================================================
 
-def train_model(model: FLDD, train_loader, dataset, num_epochs=None):
+def train_model(model: FLDD, train_loader, dataset, output_path, num_epochs=None):
     """
     Training loop following paper specifications.
     """
@@ -1019,11 +1017,10 @@ def train_model(model: FLDD, train_loader, dataset, num_epochs=None):
     # Initialize FID metric only for image datasets
     fid = None
     max_fid_samples = 2048  # Limit samples for FID to save memory
+    tc_weight = 1e-4
     if dataset == "MNIST":
         fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-        f = open(
-            f"outputs/mnist_fid_{model.transport_plan.__name__}{'learnable' if isinstance(model.transport_plan, SinkhornTransportModel) else 'fixed'}.csv", "w")
-
+        f = open(f"{output_path}/mnist_fid_tc{tc_weight:.0e}.csv", "w")
     # Calculate epochs based on total steps
     steps_per_epoch = len(train_loader)
     if num_epochs is None:
@@ -1077,6 +1074,7 @@ def train_model(model: FLDD, train_loader, dataset, num_epochs=None):
         avg_loss = np.mean(epoch_losses) if epoch_losses else 0
         losses.append(avg_loss)
         print(f'Epoch {epoch+1}: Avg Loss = {avg_loss:.4f}')
+        from SinkhornTransport import SinkhornTransportModel
         if isinstance(model.transport_plan, SinkhornTransportModel):
             print("Transport Plan Parameters:")
             for name, param in model.transport_plan.named_parameters():
@@ -1084,32 +1082,40 @@ def train_model(model: FLDD, train_loader, dataset, num_epochs=None):
 
         # Generate samples periodically
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            visualize_samples(model, epoch + 1, "")
+            visualize_samples(model, epoch + 1, "", save_dir=output_path)
 
             # Compute FID only for image datasets like MNIST
+            from torchvision.transforms import Resize
+
             if dataset == "MNIST" and real_images:
-                # Concatenate all real images from this epoch
-                real_batch = torch.cat(real_images, dim=0)
-                fid.update(real_batch, real=True)  # type:ignore
-
-                # Generate fake images (same number as real) in batches to save memory
-                num_samples = real_batch.shape[0]
+                batch_size_fid = 128
                 sample_shape = (28, 28)
-                batch_size = 128
-                fake_samples_list = []
-                for i in range(0, num_samples, batch_size):
-                    batch_num = min(batch_size, num_samples - i)
-                    fake_batch = model.sample(
-                        num_samples=batch_num, sample_shape=sample_shape)
-                    fake_samples_list.append(fake_batch)
-                fake_samples = torch.cat(fake_samples_list, dim=0)
-                fake_rgb = fake_samples.unsqueeze(1).repeat(1, 3, 1, 1)
-                fid.update(fake_rgb, real=False)  # type:ignore
 
-                fid_score = fid.compute()  # type:ignore
+                # --- Real images ---
+                for batch_real in real_images:
+                    batch_rgb = batch_real
+                    fid.update(batch_rgb.to(device), real=True)
+                    del batch_rgb
+                    torch.cuda.empty_cache()
+
+                # --- Fake images ---
+                num_samples = sum(img.shape[0] for img in real_images)
+                for i in range(0, num_samples, batch_size_fid):
+                    curr_batch_size = min(batch_size_fid, num_samples - i)
+                    fake_batch = model.sample(num_samples=curr_batch_size, sample_shape=sample_shape)
+                    if fake_batch.ndim == 3:
+                        fake_batch = fake_batch.unsqueeze(1)
+                    fake_rgb = fake_batch.repeat(1, 3, 1, 1).to(device)
+                    fid.update(fake_rgb, real=False)
+                    del fake_rgb
+                    torch.cuda.empty_cache()
+
+                # --- Calcolo finale FID ---
+                fid_score = fid.compute()
                 print(f'Epoch {epoch+1}: FID = {fid_score:.4f}')
-                f.write(f'{epoch}, {fid_score:.4f}\n')  # type:ignore
-                fid.reset()  # Reset for next computation # type:ignore
+                f.write(f'{epoch}, {fid_score:.4f}\n')
+                fid.reset()
+                torch.cuda.empty_cache()
 
         if model.current_step >= model.total_steps:
             break
@@ -1199,27 +1205,39 @@ def visualize_diffusion_process(model, test_loader, dataset, save_dir='./outputs
 # =============================================================================
 
 
+import argparse
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tc_weight', type=float, default=1e-4, help='TC weight for training')
+    parser.add_argument('--other_param', type=int, default=42, help='Another parameter')
+    args = parser.parse_args()
+
+    tc_weight = args.tc_weight
+
     """Main training script."""
     print("=" * 60)
     print("Forward-Learned Discrete Diffusion (FLDD) - Corrected")
     print("=" * 60)
     print(f"Device: {device}")
 
+    print(f"Training with tc_weight = {tc_weight}")
+
     # Create output directory
-    os.makedirs('./outputs', exist_ok=True)
+    output_path = f'./outputs/tc_{tc_weight:.0e}'  # e.g., ./outputs/tc_1e-2
+    os.makedirs(output_path, exist_ok=True)
+    print(f"Saving all outputs to: {output_path}")
 
     # Prepare data
-    dataset_name = "TwoGaussians"
-    train_loader, test_loader = prepare_data(
-        dataset=dataset_name, batch_size=128)
-
+    dataset_name = "MNIST"
+    train_loader, test_loader = prepare_data(dataset=dataset_name, batch_size=128)
+    
     # Initialize model
     # Using T=10 as in paper experiments for few-step generation
     vocab_size, num_timesteps = (2, 10) if dataset_name == "MNIST" else (50, 2)
     if dataset_name == "MNIST":
         vocab_size = 2
-        num_timesteps = 10
+        num_timesteps = 4
         hidden_dim = 128
         time_dim = 128
         forward_nn_model = FLDDNetwork(
@@ -1239,7 +1257,8 @@ def main():
         num_timesteps=num_timesteps,  # Few-step generation
         forward_net=forward_nn_model,
         reverse_net=reverse_nn_model,
-        tc_weight=1e-2
+        warmup_steps=1000,
+        tc_weight=tc_weight
     )
 
     print(f"\nModel Configuration:")
@@ -1259,7 +1278,7 @@ def main():
     print("=" * 60)
 
     # Train model
-    losses = train_model(model, train_loader, dataset_name, num_epochs=30)
+    losses = train_model(model, train_loader, dataset_name, output_path, num_epochs=30)
 
     # Plot training curve
     plt.figure(figsize=(10, 4))
@@ -1272,7 +1291,7 @@ def main():
     plt.title('FLDD Training Loss')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('./outputs/training_curve.png', dpi=150)
+    plt.savefig(f'{output_path}/training_curve.png', dpi=150)
     plt.close()
 
     if dataset_name == "TwoGaussians":
@@ -1292,13 +1311,13 @@ def main():
             cmap="viridis",
             origin="lower"
         )
-        plt.savefig('./outputs/gaussian_samples.png')
+        plt.savefig(f'{output_path}/gaussian_samples.png')
         plt.show()
         import sys
         sys.exit(0)
 
     # Visualize diffusion process
-    visualize_diffusion_process(model, test_loader, dataset_name)
+    visualize_diffusion_process(model, test_loader, dataset_name, output_path)
 
     # Generate final samples
     print("\nGenerating final samples...")
@@ -1311,7 +1330,7 @@ def main():
 
     plt.suptitle(f'FLDD Final Samples (T={model.num_timesteps} steps)')
     plt.tight_layout()
-    plt.savefig('./outputs/final_samples.png', dpi=150)
+    plt.savefig(f'{output_path}/final_samples.png', dpi=150)
     plt.close()
 
     # Save model
