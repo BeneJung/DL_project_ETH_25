@@ -456,17 +456,27 @@ class FLDD:
     """
 
     def __init__(self, vocab_size, num_timesteps, forward_net, reverse_net,
-                 transportplan: str = "maximum", warmup_steps=50000, tc_weight=0):
+                 transportplan: str = "maximum", warmup_steps=50000, tc_weight=0, use_baseline=True, baseline_beta=0.9):
         """
         Args:
             vocab_size: Number of discrete values (2 for binary MNIST)
             num_timesteps: Number of diffusion steps T
             hidden_dim: Hidden dimension for networks
             time_dim: Dimension of time embeddings
+            use_baseline: Whether to use variance-reducing baseline
+            baseline_beta: EMA decay rate for baseline estimation
         """
         self.vocab_size = vocab_size
         self.num_timesteps = num_timesteps
         self.device = device
+        self.use_baseline = use_baseline
+        self.baseline_beta = baseline_beta
+
+        # Baseline tracking
+        if self.use_baseline:
+            self.baseline_ema = torch.zeros(num_timesteps + 1)
+            self.baseline_weights = torch.zeros(num_timesteps + 1)  # For weighted average
+            self.baseline_counts = torch.zeros(num_timesteps + 1)
 
         # =====================================================================
         # Networks
@@ -773,6 +783,66 @@ class FLDD:
         
         
         return total_loss
+
+    def compute_gradient_norm_squared(self, log_probs):
+        """
+        Compute squared norm of gradient w.r.t forward network parameters.
+
+        Args:
+            log_probs: Tensor of log probabilities [batch]
+
+        Returns:
+            squared_norm: Scalar tensor
+        """
+        # Average over batch for a scalar
+        # Not sample dependent like the optimal baseline in derivation. Use mean to approximate.
+        avg_log_prob = log_probs.mean()
+
+        # Compute gradient of avg_log_prob w.r.t forward_net parameters
+        gradients = torch.autograd.grad(
+            outputs=avg_log_prob,
+            inputs=self.forward_net.parameters(),
+            retain_graph=True,
+            create_graph=False
+        )
+
+        # Compute squared L2 norm
+        squared_norm = sum((g ** 2).sum() for g in gradients if g is not None)
+        return squared_norm
+
+    def update_baseline(self, t, kl_value, gradient_norm_sq):
+        """
+        Update baseline estimate for timestep t using EMA.
+
+        Equation (B): b* = E[w(z_t) * KL] / E[w(z_t)]
+        We use EMA to estimate numerator and denominator.
+
+        For the first update: baseline = kl (use sample directly)
+        For subsequent updates: EMA with decay β
+        """
+        if not self.use_baseline:
+            return 0
+
+        w = gradient_norm_sq
+        kl = kl_value
+
+        if self.baseline_counts[t] == 0:
+            # First update: use the sample directly
+            self.baseline_ema[t] = kl
+            self.baseline_weights[t] = w
+        else:
+            # EMA update: new = (1-β) * new_sample + β * old
+            old_numerator = self.baseline_ema[t] * self.baseline_weights[t]
+            old_denominator = self.baseline_weights[t]
+
+            new_numerator = old_numerator * self.baseline_beta + w * kl * (1 - self.baseline_beta)
+            new_denominator = old_denominator * self.baseline_beta + w * (1 - self.baseline_beta)
+
+            self.baseline_ema[t] = new_numerator / (new_denominator + 1e-8)
+            self.baseline_weights[t] = new_denominator
+
+        self.baseline_counts[t] += 1
+        return self.baseline_ema[t]
     
     def reinforce_step(self, x):
         """
@@ -825,11 +895,44 @@ class FLDD:
             kl_per_position.size(0), -1).sum(dim=1)  # [batch]
         kl_loss = kl_per_sample.mean()
 
-        # REINFORCE gradient (Equation 13)
+        # 2. Compute gradient norm squared for optimal baseline (Equation B)
+        if self.use_baseline:
+            with torch.enable_grad():
+                # We need gradient of log_prob_sum w.r.t forward_net parameters
+                # Use torch.autograd.grad to compute without affecting .grad
+                # baseline not dependent on x because it would be too computationally expensive. Only dependent on time.
+                avg_log_prob = log_prob_sum.mean()
+
+                gradients = torch.autograd.grad(
+                    outputs=avg_log_prob,
+                    inputs=self.forward_net.parameters(),
+                    retain_graph=True,  # Keep graph for main loss
+                    create_graph=False,  # Don't need higher-order gradients
+                    allow_unused=True  # Some parameters might not be used
+                )
+
+                # Compute squared L2 norm of gradients
+                gradient_norm_sq = 0
+                for g in gradients:
+                    if g is not None:
+                        gradient_norm_sq = gradient_norm_sq + (g ** 2).sum()
+
+                # Get KL value for baseline update
+                kl_value = kl_per_sample.mean().item()
+                w_value = gradient_norm_sq.item()
+
+                # Update baseline estimate using EMA
+                baseline_value = self.update_baseline(t, kl_value, w_value)
+                baseline_tensor = torch.tensor(baseline_value, device=x.device)
+        else:
+            baseline_tensor = torch.tensor(0.0, device=x.device)
+
+        # REINFORCE gradient with baseline (Eq A with baseline subtraction)
+        # g = (KL(z_t) - b(x,t)) * ∇_φ log q_φ(z_t|x)
         # The gradient through sampling is: log_prob × [reward]_sg
         # Here "reward" is negative KL (we want to minimize KL)
         # But since we're minimizing, we use KL directly
-        reinforce_loss = (log_prob_sum * kl_per_sample.detach()).mean()
+        reinforce_loss = (log_prob_sum * (kl_per_sample.detach() - baseline_tensor)).mean()
 
         # Total loss
         total_loss = kl_loss + reinforce_loss
@@ -1211,9 +1314,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tc_weight', type=float, default=1e-4, help='TC weight for training')
     parser.add_argument('--other_param', type=int, default=42, help='Another parameter')
+    parser.add_argument('--baseline_beta', type=float, default=0.9, help='Baseline beta for REINFORCE baseline')
     args = parser.parse_args()
 
     tc_weight = args.tc_weight
+    baseline_beta = args.baseline_beta
 
     """Main training script."""
     print("=" * 60)
@@ -1221,10 +1326,10 @@ def main():
     print("=" * 60)
     print(f"Device: {device}")
 
-    print(f"Training with tc_weight = {tc_weight}")
+    print(f"Training with tc_weight = {tc_weight}, baseline_beta = {baseline_beta}")
 
     # Create output directory
-    output_path = f'./outputs/tc_{tc_weight:.0e}'  # e.g., ./outputs/tc_1e-2
+    output_path = f'./outputs/tc_{tc_weight:.0e}_beta_{baseline_beta}'  # Updated naming  # e.g., ./outputs/tc_1e-2
     os.makedirs(output_path, exist_ok=True)
     print(f"Saving all outputs to: {output_path}")
 
@@ -1269,6 +1374,8 @@ def main():
     print(f"  - Total steps: {model.total_steps:,}")
     print(f"  - Learning rate: 2e-4 (AdamW)")
     print(f"  - Temperature: {model.temperature} → {model.min_temperature}")
+    print(f"  - TC weight: {tc_weight}")
+    print(f"  - Baseline beta: {baseline_beta}")
 
     # Count parameters
     forward_params = sum(p.numel() for p in model.forward_net.parameters())
@@ -1340,7 +1447,9 @@ def main():
         'config': {
             'vocab_size': model.vocab_size,
             'num_timesteps': model.num_timesteps,
-            'total_steps_trained': model.current_step
+            'total_steps_trained': model.current_step,
+            'tc_weight': tc_weight,
+            'baseline_beta': baseline_beta
         }
     }, './outputs/fldd_mnist_final.pth')
 
