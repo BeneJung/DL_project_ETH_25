@@ -206,30 +206,46 @@ def sinkhorn_testing():
     # print(gamma)
     pass
 
+import argparse
 
 def main():
-    """Main training script taken from fldd file"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tc_weight', type=float, default=1e-4, help='TC weight for training')
+    parser.add_argument('--other_param', type=int, default=42, help='Another parameter')
+    parser.add_argument('--transport', type=str, default="maximum", help='Transport method')
+    args = parser.parse_args()
+
+    tc_weight = args.tc_weight
+    transport = args.transport
+
+    """Main training script."""
     print("=" * 60)
     print("Forward-Learned Discrete Diffusion (FLDD) - Corrected")
     print("=" * 60)
     print(f"Device: {device}")
+    print(f"Training with tc_weight = {tc_weight}")
 
     # Create output directory
-    os.makedirs('./outputs', exist_ok=True)
+    dataset_name = "MNIST"
+    dataset_name = "TwoGaussians"
+
+    # transport = "sinkhorn"
+    transport = "sinkhorn_learnable"
+    # transport = "maximum"
+    
+    output_path = f'./outputs/tc_{tc_weight:.0e}_{dataset_name}_{transport}'  # e.g., ./outputs/tc_1e-2
+    os.makedirs(output_path, exist_ok=True)
+    print(f"Saving all outputs to: {output_path}")
 
     # Prepare data
-    # dataset_name = "MNIST"
-    dataset_name = "TwoGaussians"
-    train_loader, test_loader = prepare_data(
-        dataset=dataset_name, batch_size=128)
-
+    train_loader, test_loader = prepare_data(dataset=dataset_name, batch_size=128)
+    
     # Initialize model
     # Using T=10 as in paper experiments for few-step generation
-    vocab_size, num_timesteps = (
-        2, 10) if dataset_name == "MNIST" else (50, 10)
+    vocab_size, num_timesteps = (2, 10) if dataset_name == "MNIST" else (50, 2)
     if dataset_name == "MNIST":
         vocab_size = 2
-        num_timesteps = 10
+        num_timesteps = 4
         hidden_dim = 128
         time_dim = 128
         forward_nn_model = FLDDNetwork(
@@ -244,8 +260,7 @@ def main():
     else:
         raise Exception("Invalid or unknown dataset name")
 
-    transport = "sinkhorn"
-    # transport = "sinkhorn_learnable"
+   
     model = FLDD(
         vocab_size=vocab_size,      # Binary images
         num_timesteps=num_timesteps,  # Few-step generation
@@ -273,7 +288,7 @@ def main():
     print("=" * 60)
 
     # Train model
-    losses = train_model(model, train_loader, dataset_name, num_epochs=30)
+    losses = train_model(model, train_loader, dataset_name, output_path, num_epochs=50)
 
     # Plot training curve
     plt.figure(figsize=(10, 4))
@@ -286,7 +301,7 @@ def main():
     plt.title('FLDD Training Loss')
     plt.legend()
     plt.tight_layout()
-    plt.savefig(f'./outputs/training_curve_{transport}_{dataset_name}.png', dpi=150)
+    plt.savefig(f'{output_path}/training_curve.png', dpi=150)
     plt.close()
 
     if dataset_name == "TwoGaussians":
@@ -306,13 +321,13 @@ def main():
             cmap="viridis",
             origin="lower"
         )
-        plt.savefig(f'./outputs/gaussian_samples_{transport}.png')
+        plt.savefig(f'{output_path}/gaussian_samples.png')
         plt.show()
         import sys
         sys.exit(0)
 
     # Visualize diffusion process
-    visualize_diffusion_process(model, test_loader, dataset_name)
+    visualize_diffusion_process(model, test_loader, dataset_name, output_path)
 
     # Generate final samples
     print("\nGenerating final samples...")
@@ -325,7 +340,7 @@ def main():
 
     plt.suptitle(f'FLDD Final Samples (T={model.num_timesteps} steps)')
     plt.tight_layout()
-    plt.savefig('./outputs/final_samples.png', dpi=150)
+    plt.savefig(f'{output_path}/final_samples.png', dpi=150)
     plt.close()
 
     # Save model
@@ -344,6 +359,7 @@ def main():
     print(f"✓ Model saved to ./outputs/fldd_mnist_final.pth")
     print(f"✓ Total steps trained: {model.current_step:,}")
     print(f"{'=' * 60}")
+
 
 
 if __name__ == "__main__":

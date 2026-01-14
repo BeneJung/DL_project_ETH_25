@@ -8,7 +8,7 @@ After logging in the cluster:
 - setting up cuda and pytorch/python packages [link](https://www.isg.inf.ethz.ch/Main/HelpClusterComputingStudentClusterCuda): 
     ```bash
     # add cuda
-    module add cuda 12.9
+    module add cuda/12.9
     # create venv in home/[nethz]
     python3 -m venv ./venv 
     # activate venv
@@ -21,6 +21,9 @@ After logging in the cluster:
   ```bash
   cd DL_project
   srun --pty -A deep_learning -t 120 python3 SinkhornTransport.py
+  # Not attached
+  srun  -A deep_learning -t 120 python3 SinkhornTransport.py --transport sinkhorn  > logs/transport_sinkhorn.log &
+
   ```
 
 - clearing clash
