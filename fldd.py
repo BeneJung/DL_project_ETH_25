@@ -1333,8 +1333,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tc_weight', type=float,
                         default=1e-4, help='TC weight for training')
-    parser.add_argument('--other_param', type=int,
-                        default=42, help='Another parameter')
     parser.add_argument('--baseline_beta', type=float, default=0.9,
                         help='Baseline beta for REINFORCE baseline')
     parser.add_argument('--use_baseline', type=lambda x: (str(x).lower() == 'true'), default=True,
