@@ -1133,10 +1133,9 @@ def train_model(model: FLDD, train_loader, dataset, output_path, num_epochs=None
     # Initialize FID metric only for image datasets
     fid = None
     max_fid_samples = 2048  # Limit samples for FID to save memory
-    tc_weight = 1e-4
     if dataset == "MNIST":
         fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-        f = open(f"{output_path}/mnist_fid_tc{tc_weight:.0e}.csv", "w")
+        f = open(f"{output_path}/mnist_fid_tc{model.tc_weight:.0e}.csv", "w")
     from SinkhornTransport import SinkhornTransportModel
     if isinstance(model.transport_plan, SinkhornTransportModel):
         f2 = open(f"{output_path}/sinkhorn_transport_params.csv", "w")
