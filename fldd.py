@@ -1500,7 +1500,6 @@ def main():
     print(f"✓ Model saved to {output_path}/fldd_mnist_final.pth")
     print(f"✓ Total steps trained: {model.current_step:,}")
     print(f"{'=' * 60}")
-    print(model.current_step)
 
 
 if __name__ == "__main__":
