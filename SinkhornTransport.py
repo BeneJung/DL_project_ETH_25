@@ -10,8 +10,14 @@ from fldd import *
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
+# fix for certificate error
+import certifi
 
-class SinkhornTransportModel:
+# Set environment variables to use certifi's bundle
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+os.environ["SSL_CERT_FILE"] = certifi.where()
+
+class SinkhornTransportModel(nn.Module):
     """
     Implements a optimal transport plan following the method presented in "Sinkhorn Distances: 
     Lightspeed computation of optimal transportation distances" by Cuturi, 2015.
@@ -21,14 +27,18 @@ class SinkhornTransportModel:
     """
     C: torch.Tensor
 
-    def __init__(self, vocab, lam=1, threshold=5e-7, C=None):
+    def __init__(self, vocab, lam=1, threshold=5e-7, C=None, learnable=False):
         # Default: C_{u,v} = 1_{u\neq v}
+        super().__init__()
         print("Using Sinkhorn Transport")
         if C is not None:
             self.C = C
             assert self.C.shape[-2:] == (vocab, vocab)
         else:
             self.C: torch.Tensor = torch.ones((vocab, vocab)).fill_diagonal_(0)
+        if learnable:
+            self.C = torch.nn.Parameter(self.C)
+        self.learnable = learnable
         self.vocab = vocab
         self.lam = lam
         self.threshold = threshold
@@ -45,10 +55,10 @@ class SinkhornTransportModel:
           P: optimal transport matrix of shape (K, K), res[r, c] = q_(z_s = r, z_t = s)
           err: Error
         """
-
         ndim = a.ndim
         eps = 1e-8
         P: torch.Tensor = torch.exp(-self.C / self.lam)
+        P = P.to(device=device)
         P = P.view([1 for _ in range(ndim-1)]+[self.vocab, self.vocab])
         pdim = list(a.shape[:-1])+[1, 1]
         P = P.repeat(pdim)
@@ -123,7 +133,13 @@ class SinkhornTransportModel:
         device = u_s.device
 
         # Initialize output
-        posterior = torch.zeros_like(u_s)
+        posterior = torch.zeros_like(u_s, device=device)
+        # Precompute optimal transport (the same matrix for all k)
+        eps = 1e-8
+        a, b = u_s, u_t
+        P, err = self.compute_optimal_transport(
+            a, b)  # shape [batch, H, W, vocab, vocab]
+        res = P / (P.sum(-2, keepdim=True) + eps)
 
         # Weighted average over all possible discrete values k
         for k in range(vocab):
@@ -132,7 +148,9 @@ class SinkhornTransportModel:
                                   dtype=torch.long, device=device)
 
             # Compute posterior assuming z_t = k
-            posterior_k = self.compute_posterior(u_s, u_t, z_t_hard)
+            index = z_t_hard.unsqueeze(-1).unsqueeze(-1).expand(
+                list(a.shape[:-1]) + [self.vocab, 1])
+            posterior_k =  torch.gather(res, dim=-1, index=index).squeeze(-1)
 
             # Weight by the soft probability of z_t being k
             weight = z_t_soft[:, :, :, k:k+1]  # [batch, H, W, 1]
@@ -186,29 +204,45 @@ def sinkhorn_testing():
     # print(gamma)
     pass
 
+import argparse
 
 def main():
-    """Main training script taken from fldd file"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tc_weight', type=float, default=1e-4, help='TC weight for training')
+    parser.add_argument('--transport', type=str, default="maximum", help='Transport method')
+    args = parser.parse_args()
+
+    tc_weight = args.tc_weight
+    transport = args.transport
+
+    """Main training script."""
     print("=" * 60)
     print("Forward-Learned Discrete Diffusion (FLDD) - Corrected")
     print("=" * 60)
     print(f"Device: {device}")
+    print(f"Training with tc_weight = {tc_weight}")
 
     # Create output directory
-    os.makedirs('./outputs', exist_ok=True)
+    dataset_name = "MNIST"
+    dataset_name = "TwoGaussians"
+
+    # transport = "sinkhorn"
+    transport = "sinkhorn_learnable"
+    # transport = "maximum"
+    
+    output_path = f'./outputs/tc_{tc_weight:.0e}_{dataset_name}_{transport}'  # e.g., ./outputs/tc_1e-2
+    os.makedirs(output_path, exist_ok=True)
+    print(f"Saving all outputs to: {output_path}")
 
     # Prepare data
-    dataset_name = "TwoGaussians"
-    train_loader, test_loader = prepare_data(
-        dataset=dataset_name, batch_size=128)
-
+    train_loader, test_loader = prepare_data(dataset=dataset_name, batch_size=128)
+    
     # Initialize model
     # Using T=10 as in paper experiments for few-step generation
-    vocab_size, num_timesteps = (
-        2, 10) if dataset_name == "MNIST" else (50, 10)
+    vocab_size, num_timesteps = (2, 10) if dataset_name == "MNIST" else (50, 2)
     if dataset_name == "MNIST":
         vocab_size = 2
-        num_timesteps = 10
+        num_timesteps = 4
         hidden_dim = 128
         time_dim = 128
         forward_nn_model = FLDDNetwork(
@@ -223,7 +257,7 @@ def main():
     else:
         raise Exception("Invalid or unknown dataset name")
 
-    transport = "maximum"
+   
     model = FLDD(
         vocab_size=vocab_size,      # Binary images
         num_timesteps=num_timesteps,  # Few-step generation
@@ -241,6 +275,7 @@ def main():
     print(f"  - Total steps: {model.total_steps:,}")
     print(f"  - Learning rate: 2e-4 (AdamW)")
     print(f"  - Temperature: {model.temperature} → {model.min_temperature}")
+    print(f"  - Transport Plan: {transport}")
 
     # Count parameters
     forward_params = sum(p.numel() for p in model.forward_net.parameters())
@@ -250,7 +285,7 @@ def main():
     print("=" * 60)
 
     # Train model
-    losses = train_model(model, train_loader, num_epochs=30)
+    losses = train_model(model, train_loader, dataset_name, output_path, num_epochs=50)
 
     # Plot training curve
     plt.figure(figsize=(10, 4))
@@ -263,7 +298,7 @@ def main():
     plt.title('FLDD Training Loss')
     plt.legend()
     plt.tight_layout()
-    plt.savefig(f'./outputs/training_curve_{transport}.png', dpi=150)
+    plt.savefig(f'{output_path}/training_curve.png', dpi=150)
     plt.close()
 
     if dataset_name == "TwoGaussians":
@@ -283,13 +318,13 @@ def main():
             cmap="viridis",
             origin="lower"
         )
-        plt.savefig(f'./outputs/gaussian_samples_{transport}.png')
+        plt.savefig(f'{output_path}/gaussian_samples.png')
         plt.show()
         import sys
         sys.exit(0)
 
     # Visualize diffusion process
-    visualize_diffusion_process(model, test_loader)
+    visualize_diffusion_process(model, test_loader, dataset_name, output_path)
 
     # Generate final samples
     print("\nGenerating final samples...")
@@ -302,7 +337,7 @@ def main():
 
     plt.suptitle(f'FLDD Final Samples (T={model.num_timesteps} steps)')
     plt.tight_layout()
-    plt.savefig('./outputs/final_samples.png', dpi=150)
+    plt.savefig(f'{output_path}/final_samples.png', dpi=150)
     plt.close()
 
     # Save model
@@ -321,6 +356,7 @@ def main():
     print(f"✓ Model saved to ./outputs/fldd_mnist_final.pth")
     print(f"✓ Total steps trained: {model.current_step:,}")
     print(f"{'=' * 60}")
+
 
 
 if __name__ == "__main__":

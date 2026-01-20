@@ -11,12 +11,12 @@ Key Concepts:
 3. Train with Concrete relaxation warm-up followed by REINFORCE.
 """
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from dask.array import shape
-from distributed.diagnostics.plugin import forward_stream
 from torch.distributions import Categorical, RelaxedOneHotCategorical
 import numpy as np
 from torchvision import datasets, transforms
@@ -27,11 +27,13 @@ import math
 import os
 
 from two_gaussians import TwoGaussians
-from SinkhornTransport import SinkhornTransportModel
+
+from torchmetrics.image.fid import FrechetInceptionDistance
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+if __name__ == "__main__":
+    print(f"Using device: {device}")
 
 
 # =============================================================================
@@ -455,17 +457,28 @@ class FLDD:
     """
 
     def __init__(self, vocab_size, num_timesteps, forward_net, reverse_net,
-                 transportplan: str = "maximum", warmup_steps=50000):
+                 transportplan: str = "maximum", warmup_steps=50000, tc_weight=0, use_baseline=True, baseline_beta=0.9):
         """
         Args:
             vocab_size: Number of discrete values (2 for binary MNIST)
             num_timesteps: Number of diffusion steps T
             hidden_dim: Hidden dimension for networks
             time_dim: Dimension of time embeddings
+            use_baseline: Whether to use variance-reducing baseline
+            baseline_beta: EMA decay rate for baseline estimation
         """
         self.vocab_size = vocab_size
         self.num_timesteps = num_timesteps
         self.device = device
+        self.use_baseline = use_baseline
+        self.baseline_beta = baseline_beta
+
+        # Baseline tracking
+        if self.use_baseline:
+            self.baseline_ema = torch.zeros(num_timesteps + 1)
+            self.baseline_weights = torch.zeros(
+                num_timesteps + 1)  # For weighted average
+            self.baseline_counts = torch.zeros(num_timesteps + 1)
 
         # =====================================================================
         # Networks
@@ -475,11 +488,14 @@ class FLDD:
 
         # Reverse network: takes z_t, outputs v_θ(z_t, t) for p_θ(z_s|z_t)
         self.reverse_net = reverse_net
-
+        from SinkhornTransport import SinkhornTransportModel
         if transportplan == "maximum":
             self.transport_plan = MaximumCoupling
         elif transportplan == "sinkhorn":
             self.transport_plan = SinkhornTransportModel(vocab_size)
+        elif transportplan == "sinkhorn_learnable":
+            self.transport_plan = SinkhornTransportModel(
+                vocab_size, learnable=True)
         else:
             raise ValueError("Unknown transport plan")
 
@@ -488,7 +504,9 @@ class FLDD:
         # =====================================================================
         self.optimizer = optim.AdamW(
             list(self.forward_net.parameters()) +
-            list(self.reverse_net.parameters()),
+            list(self.reverse_net.parameters()) +
+            list(self.transport_plan.parameters() if isinstance(
+                self.transport_plan, nn.Module) else []),
             lr=2e-4
         )
 
@@ -497,7 +515,7 @@ class FLDD:
         # =====================================================================
         # Paper: warm up for 10^5 steps, then REINFORCE for 100k iterations
         self.warmup_steps = warmup_steps   # Reduced for faster experimentation
-        self.reinforce_steps = 50000
+        self.reinforce_steps = 11725
         self.total_steps = self.warmup_steps + self.reinforce_steps
         self.current_step = 0
 
@@ -506,21 +524,21 @@ class FLDD:
         self.min_temperature = 1e-3
         self.temp_decay_rate = (self.min_temperature /
                                 1.0) ** (1.0 / self.warmup_steps)
-
+        self.tc_weight = tc_weight
         # For logging
         self.losses = []
 
     def get_forward_marginals(self, x, t):
         """
         Get q_φ(z_t | x) - the forward marginal distribution.
-        
+
         This is parameterized by the forward network, with boundary conditions:
         - t = 0: q(z_0|x) = δ(z_0 - x)  (deterministic = original data)
         - t = T: q(z_T|x) = p(z_T)      (uniform prior)
-        
+
         For intermediate t, we use the network output with interpolation
         to ensure smooth boundaries.
-        
+
         Args:
             x: [batch, H, W] - original discrete data
             t: int - timestep (0 to T)
@@ -634,6 +652,77 @@ class FLDD:
 
         return kl.sum(dim=-1)
 
+    def estimate_tc_mws(self, posterior_probs, z_samples):
+        """
+        Estimates Total Correlation (TC) using Minibatch Weighted Sampling (MWS).
+
+        Calculates KL( q(z_s|z_t) || prod_d q(z_s^d|z_t) ) where q(z_s|z_t) is the 
+        aggregated posterior approximated by the minibatch.
+
+        Formula from Chen et al. (Beta-TCVAE):
+        E_q(z) [ log q(z) - sum_d log q(z_d) ]
+
+        Args:
+            posterior_probs: [Batch, H, W, Vocab] - Parameters of q(z_s | z_t, x_n) for each n
+            z_samples: [Batch, H, W] - Discrete samples drawn from posterior_probs
+
+        Returns:
+            tc_estimate: Scalar tensor approximating the Total Correlation.
+        """
+        B, H, W, V = posterior_probs.shape
+
+        # 1. Compute log probabilities of the samples under ALL distributions in the batch
+        # We need log q(z_sample_i | x_j) for all i, j.
+        # This requires broadcasting:
+        # posterior_probs: [1, B, H, W, V] (distributions)
+        # z_samples:       [B, 1, H, W]    (samples)
+
+        probs_expanded = posterior_probs.unsqueeze(
+            0).expand(B, -1, -1, -1, -1)  # [1, B, H, W, V]
+        z_expanded = z_samples.unsqueeze(
+            1).unsqueeze(-1)  # [B, 1, H, W, 1] for gather
+
+        # Gather probabilities of the sampled classes
+        # gathered_probs[i, j, h, w] = prob of sample i's pixel at (h,w) under posterior j
+        gathered_probs = torch.gather(
+            # [B, B, H, W]
+            probs_expanded, -1, z_expanded.expand(B, B, H, W, 1)).squeeze(-1)
+
+        # Sum over spatial dimensions (H, W) to get log prob of the full latent state
+        # log_prob_matrix[i, j] = log q(z_i | z_t, x_j)
+        log_prob_matrix = torch.log(
+            gathered_probs + 1e-10).sum(dim=(2, 3))  # [B, B]
+
+        # 2. Estimate log q(z_s | z_t) (Aggregated Posterior)
+        # q(z) = 1/B * sum_j q(z|x_j)
+        # log q(z_i) = log(1/B) + logsumexp_j( log q(z_i|x_j) )
+        log_q_z = torch.logsumexp(log_prob_matrix, dim=1) - torch.log(
+            torch.tensor(B, dtype=torch.float32, device=self.device))
+
+        # 3. Estimate log prod_d q(z_s^d | z_t) (Product of Marginals)
+        # First, compute marginals averaged over batch: q_bar(z^d) = 1/B sum_j q(z^d | x_j)
+        # posterior_probs: [B, H, W, V] -> mean over dim 0 -> [H, W, V]
+        marginal_probs = posterior_probs.mean(dim=0)  # [H, W, V]
+
+        # Now compute log prob of samples under these marginals
+        # z_samples: [B, H, W]
+        z_samples_long = z_samples.long().unsqueeze(-1)  # [B, H, W, 1]
+
+        # Gather marginal probabilities for the specific samples
+        gathered_marginals = torch.gather(marginal_probs.unsqueeze(0).expand(
+            B, H, W, V), -1, z_samples_long).squeeze(-1)  # [B, H, W]
+
+        # Sum log probs over dimensions
+        # log_prod_marginals[i] = sum_d log q_bar(z_i^d)
+        log_prod_marginals = torch.log(
+            gathered_marginals + 1e-10).sum(dim=(1, 2))  # [B]
+
+        # 4. Compute TC
+        # TC = E [ log q(z) - log prod q(z_d) ]
+        tc_estimate = (log_q_z - log_prod_marginals).mean()
+
+        return tc_estimate
+
     def warmup_step(self, x):
         """
         Relaxed optimization step using Concrete distribution (Section 3.3).
@@ -685,7 +774,86 @@ class FLDD:
             prior_loss = self.compute_kl_divergence(u_t, prior).mean()
             kl_loss = kl_loss + 0.1 * prior_loss
 
-        return kl_loss
+        # =====================================================================
+        # TC REGULARIZATION (New)
+        # =====================================================================
+        # Even though we are in warmup (soft), MWS requires discrete samples to
+        # index the probability matrices efficiently. We sample from the
+        # current posterior u_s_given_t specifically for the TC estimator.
+        # This acts as a Monte Carlo estimate of the TC.
+        if self.tc_weight > 0 and s > 0:
+            # Sample hard z_s for MWS estimation
+            with torch.no_grad():
+                z_s_hard = Categorical(probs=u_s_given_t).sample()
+
+            tc_loss = self.estimate_tc_mws(u_s_given_t, z_s_hard)
+            total_loss = kl_loss + self.tc_weight * tc_loss
+        else:
+            total_loss = kl_loss
+
+        return total_loss
+
+    def compute_gradient_norm_squared(self, log_probs):
+        """
+        Compute squared norm of gradient w.r.t forward network parameters.
+
+        Args:
+            log_probs: Tensor of log probabilities [batch]
+
+        Returns:
+            squared_norm: Scalar tensor
+        """
+        # Average over batch for a scalar
+        # Not sample dependent like the optimal baseline in derivation. Use mean to approximate.
+        avg_log_prob = log_probs.mean()
+
+        # Compute gradient of avg_log_prob w.r.t forward_net parameters
+        gradients = torch.autograd.grad(
+            outputs=avg_log_prob,
+            inputs=self.forward_net.parameters(),
+            retain_graph=True,
+            create_graph=False
+        )
+
+        # Compute squared L2 norm
+        squared_norm = sum((g ** 2).sum() for g in gradients if g is not None)
+        return squared_norm
+
+    def update_baseline(self, t, kl_value, gradient_norm_sq):
+        """
+        Update baseline estimate for timestep t using EMA.
+
+        Equation (B): b* = E[w(z_t) * KL] / E[w(z_t)]
+        We use EMA to estimate numerator and denominator.
+
+        For the first update: baseline = kl (use sample directly)
+        For subsequent updates: EMA with decay β
+        """
+        if not self.use_baseline:
+            return 0
+
+        w = gradient_norm_sq
+        kl = kl_value
+
+        if self.baseline_counts[t] == 0:
+            # First update: use the sample directly
+            self.baseline_ema[t] = kl
+            self.baseline_weights[t] = w
+        else:
+            # EMA update: new = (1-β) * new_sample + β * old
+            old_numerator = self.baseline_ema[t] * self.baseline_weights[t]
+            old_denominator = self.baseline_weights[t]
+
+            new_numerator = old_numerator * self.baseline_beta + \
+                w * kl * (1 - self.baseline_beta)
+            new_denominator = old_denominator * \
+                self.baseline_beta + w * (1 - self.baseline_beta)
+
+            self.baseline_ema[t] = new_numerator / (new_denominator + 1e-8)
+            self.baseline_weights[t] = new_denominator
+
+        self.baseline_counts[t] += 1
+        return self.baseline_ema[t]
 
     def reinforce_step(self, x):
         """
@@ -738,11 +906,45 @@ class FLDD:
             kl_per_position.size(0), -1).sum(dim=1)  # [batch]
         kl_loss = kl_per_sample.mean()
 
-        # REINFORCE gradient (Equation 13)
+        # 2. Compute gradient norm squared for optimal baseline (Equation B)
+        if self.use_baseline and t != self.num_timesteps:
+            with torch.enable_grad():
+                # We need gradient of log_prob_sum w.r.t forward_net parameters
+                # Use torch.autograd.grad to compute without affecting .grad
+                # baseline not dependent on x because it would be too computationally expensive. Only dependent on time.
+                avg_log_prob = log_prob_sum.mean()
+
+                gradients = torch.autograd.grad(
+                    outputs=avg_log_prob,
+                    inputs=self.forward_net.parameters(),
+                    retain_graph=True,  # Keep graph for main loss
+                    create_graph=False,  # Don't need higher-order gradients
+                    allow_unused=True  # Some parameters might not be used
+                )
+
+                # Compute squared L2 norm of gradients
+                gradient_norm_sq = 0
+                for g in gradients:
+                    if g is not None:
+                        gradient_norm_sq = gradient_norm_sq + (g ** 2).sum()
+
+                # Get KL value for baseline update
+                kl_value = kl_per_sample.mean().item()
+                w_value = gradient_norm_sq.item()
+
+                # Update baseline estimate using EMA
+                baseline_value = self.update_baseline(t, kl_value, w_value)
+                baseline_tensor = torch.tensor(baseline_value, device=x.device)
+        else:
+            baseline_tensor = torch.tensor(0.0, device=x.device)
+
+        # REINFORCE gradient with baseline (Eq A with baseline subtraction)
+        # g = (KL(z_t) - b(x,t)) * ∇_φ log q_φ(z_t|x)
         # The gradient through sampling is: log_prob × [reward]_sg
         # Here "reward" is negative KL (we want to minimize KL)
         # But since we're minimizing, we use KL directly
-        reinforce_loss = (log_prob_sum * kl_per_sample.detach()).mean()
+        reinforce_loss = (
+            log_prob_sum * (kl_per_sample.detach() - baseline_tensor)).mean()
 
         # Total loss
         total_loss = kl_loss + reinforce_loss
@@ -752,6 +954,21 @@ class FLDD:
             prior = torch.ones_like(u_t) / self.vocab_size
             prior_loss = self.compute_kl_divergence(u_t, prior).mean()
             total_loss = total_loss + 0.1 * prior_loss
+
+        # =====================================================================
+        # TC REGULARIZATION (New)
+        # =====================================================================
+        if self.tc_weight > 0 and s > 0:
+            # We need samples z_s to estimate TC.
+            # We can sample from u_s_given_t directly.
+            # Note: We detach these samples so we don't differentiate through sampling
+            # (although MWS usually operates on the probabilities themselves)
+            z_s_sampled = Categorical(probs=u_s_given_t).sample()
+
+            # The TC loss is differentiable wrt u_s_given_t (and thus phi)
+            tc_loss = self.estimate_tc_mws(u_s_given_t, z_s_sampled)
+
+            total_loss = total_loss + self.tc_weight * tc_loss
 
         return total_loss
 
@@ -871,6 +1088,7 @@ def prepare_data(dataset="MNIST", batch_size=128):
     The images are binarized with threshold 0.5, resulting in
     vocab_size = 2 (black/white pixels).
     """
+    data_root = os.path.expanduser('~/datasets')
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Lambda(discretize)
@@ -882,9 +1100,9 @@ def prepare_data(dataset="MNIST", batch_size=128):
     match dataset:
         case "MNIST":
             train_dataset = datasets.MNIST(
-                './data', train=True, transform=transform)
+                './data', train=True, transform=transform, download=True)
             test_dataset = datasets.MNIST(
-                './data', train=False, transform=transform)
+                './data', train=False, transform=transform, download=True)
         case "TwoGaussians":
             train_dataset = TwoGaussians()
             test_dataset = train_dataset
@@ -904,11 +1122,21 @@ def prepare_data(dataset="MNIST", batch_size=128):
 # TRAINING
 # =============================================================================
 
-def train_model(model, train_loader, num_epochs=None):
+def train_model(model: FLDD, train_loader, dataset, output_path, num_epochs=None):
     """
     Training loop following paper specifications.
     """
     losses = []
+
+    # Initialize FID metric only for image datasets
+    fid = None
+    max_fid_samples = 2048  # Limit samples for FID to save memory
+    if dataset == "MNIST":
+        fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+        f = open(f"{output_path}/mnist_fid_tc{model.tc_weight:.0e}.csv", "w")
+    from SinkhornTransport import SinkhornTransportModel
+    if isinstance(model.transport_plan, SinkhornTransportModel):
+        f2 = open(f"{output_path}/sinkhorn_transport_params.csv", "w")
 
     # Calculate epochs based on total steps
     steps_per_epoch = len(train_loader)
@@ -925,6 +1153,8 @@ def train_model(model, train_loader, num_epochs=None):
 
     for epoch in range(total_epochs):
         epoch_losses = []
+        real_images = []
+        total_samples = 0
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{total_epochs}')
 
         # TODO: think about whether we should train in batches or, as in the paper, with single datapoints
@@ -938,6 +1168,14 @@ def train_model(model, train_loader, num_epochs=None):
             # Training step
             loss = model.train_step(data)
             epoch_losses.append(loss)
+
+            # Accumulate real images for FID (only for MNIST)
+            if fid is not None and total_samples < max_fid_samples:
+                # Convert grayscale to RGB
+                # [batch, 1, H, W] -> [batch, 3, H, W]
+                real_rgb = data.unsqueeze(1).repeat(1, 3, 1, 1)
+                real_images.append(real_rgb)
+                total_samples += data.shape[0]
 
             # Update progress bar
             if batch_idx % 20 == 0:
@@ -953,18 +1191,63 @@ def train_model(model, train_loader, num_epochs=None):
         avg_loss = np.mean(epoch_losses) if epoch_losses else 0
         losses.append(avg_loss)
         print(f'Epoch {epoch+1}: Avg Loss = {avg_loss:.4f}')
+        if isinstance(model.transport_plan, SinkhornTransportModel):
+            print("Transport Plan Parameters:")
+            f2.write(f"{epoch}")  # type:ignore
+            for name, param in model.transport_plan.named_parameters():
+                print(f"  {name}: {param}")
+                f2.write(f"{name}, {param}\n")  # type:ignore
 
         # Generate samples periodically
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            visualize_samples(model, epoch + 1)
+            visualize_samples(model, epoch + 1, "", save_dir=output_path)
+
+            # Compute FID only for image datasets like MNIST
+            from torchvision.transforms import Resize
+
+            if dataset == "MNIST" and real_images:
+                batch_size_fid = 128
+                sample_shape = (28, 28)
+
+                # --- Real images ---
+                for batch_real in real_images:
+                    batch_rgb = batch_real
+                    fid.update(batch_rgb.to(device), real=True)
+                    del batch_rgb
+                    torch.cuda.empty_cache()
+
+                # --- Fake images ---
+                num_samples = sum(img.shape[0] for img in real_images)
+                for i in range(0, num_samples, batch_size_fid):
+                    curr_batch_size = min(batch_size_fid, num_samples - i)
+                    fake_batch = model.sample(
+                        num_samples=curr_batch_size, sample_shape=sample_shape)
+                    if fake_batch.ndim == 3:
+                        fake_batch = fake_batch.unsqueeze(1)
+                    fake_rgb = fake_batch.repeat(1, 3, 1, 1).to(device)
+                    fid.update(fake_rgb, real=False)
+                    del fake_rgb
+                    torch.cuda.empty_cache()
+
+                # --- Calcolo finale FID ---
+                fid_score = fid.compute()
+                print(f'Epoch {epoch+1}: FID = {fid_score:.4f}')
+                f.write(f'{epoch}, {fid_score:.4f}\n')
+                fid.reset()
+                torch.cuda.empty_cache()
 
         if model.current_step >= model.total_steps:
             break
 
+    if dataset == "MNIST":
+        f.close()  # type:ignore
+    if isinstance(model.transport_plan, SinkhornTransportModel):
+        f2.close() # type:ignore
+
     return losses
 
 
-def visualize_samples(model, epoch, save_dir='./outputs'):
+def visualize_samples(model: FLDD, epoch, dataset, save_dir='./outputs'):
     """Generate and save sample images."""
     os.makedirs(save_dir, exist_ok=True)
 
@@ -981,12 +1264,13 @@ def visualize_samples(model, epoch, save_dir='./outputs'):
     plt.suptitle(
         f'FLDD Samples - Epoch {epoch} ({phase}, step {model.current_step})')
     plt.tight_layout()
-    plt.savefig(f'{save_dir}/samples_epoch_{epoch}.png', dpi=150)
+    plt.savefig(f'{save_dir}/samples_epoch_{dataset}_{epoch}.png', dpi=150)
     plt.close()
-    print(f"  → Saved samples to {save_dir}/samples_epoch_{epoch}.png")
+    print(
+        f"  → Saved samples to {save_dir}/samples_epoch_{dataset}_{epoch}.png")
 
 
-def visualize_diffusion_process(model, test_loader, save_dir='./outputs'):
+def visualize_diffusion_process(model, test_loader, dataset, save_dir='./outputs'):
     """Visualize forward and reverse processes."""
     print("VISUALIZE DIFFUSION PROCESS")
     os.makedirs(save_dir, exist_ok=True)
@@ -1033,28 +1317,54 @@ def visualize_diffusion_process(model, test_loader, save_dir='./outputs'):
     plt.suptitle(
         f'FLDD: Learned Forward and Reverse Processes (T={model.num_timesteps})')
     plt.tight_layout()
-    plt.savefig(f'{save_dir}/diffusion_process.png', dpi=150)
+    plt.savefig(f'{save_dir}/{dataset}_diffusion_process.png', dpi=150)
     plt.close()
     print(
-        f"  → Saved diffusion process visualization to {save_dir}/diffusion_process.png")
-
-
+        f"  → Saved diffusion process visualization to {save_dir}/{dataset}_diffusion_process.png")
 # =============================================================================
 # MAIN
 # =============================================================================
 
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tc_weight', type=float,
+                        default=1e-4, help='TC weight for training')
+    parser.add_argument('--baseline_beta', type=float, default=0.9,
+                        help='Baseline beta for REINFORCE baseline')
+    parser.add_argument('--use_baseline', type=lambda x: (str(x).lower() == 'true'), default=True,
+                        help='Whether to use baseline (True/False)')
+    parser.add_argument('--transport', type=str,
+                        default="maximum", help='Transport method')
+    args = parser.parse_args()
+
+    tc_weight = args.tc_weight
+    baseline_beta = args.baseline_beta
+    use_baseline = args.use_baseline
+    transport = args.transport
+    dataset_name = "MNIST"
+
     """Main training script."""
     print("=" * 60)
     print("Forward-Learned Discrete Diffusion (FLDD) - Corrected")
     print("=" * 60)
     print(f"Device: {device}")
 
+    print(
+        f"Training with tc_weight = {tc_weight}, baseline_beta = {baseline_beta}")
+
     # Create output directory
-    os.makedirs('./outputs', exist_ok=True)
+    if use_baseline == True:
+        # Updated naming  # e.g., ./outputs/tc_1e-2
+        output_path = f'./outputs/{dataset_name}_tc_{tc_weight:.0e}_{transport}_beta_{baseline_beta}'
+    else:
+        # Updated naming  # e.g., ./outputs/tc_1e-2
+        output_path = f'./outputs/{dataset_name}_tc_{tc_weight:.0e}_{transport}_no_baseline'
+    os.makedirs(output_path, exist_ok=True)
+    print(f"Saving all outputs to: {output_path}")
 
     # Prepare data
-    dataset_name = "TwoGaussians"
+
     train_loader, test_loader = prepare_data(
         dataset=dataset_name, batch_size=128)
 
@@ -1063,7 +1373,7 @@ def main():
     vocab_size, num_timesteps = (2, 10) if dataset_name == "MNIST" else (50, 2)
     if dataset_name == "MNIST":
         vocab_size = 2
-        num_timesteps = 10
+        num_timesteps = 4
         hidden_dim = 128
         time_dim = 128
         forward_nn_model = FLDDNetwork(
@@ -1082,7 +1392,12 @@ def main():
         vocab_size=vocab_size,      # Binary images
         num_timesteps=num_timesteps,  # Few-step generation
         forward_net=forward_nn_model,
-        reverse_net=reverse_nn_model
+        reverse_net=reverse_nn_model,
+        warmup_steps=11725,  # 25 epochs
+        tc_weight=tc_weight,
+        use_baseline=use_baseline,
+        baseline_beta=baseline_beta,
+        transportplan=transport
     )
 
     print(f"\nModel Configuration:")
@@ -1093,6 +1408,10 @@ def main():
     print(f"  - Total steps: {model.total_steps:,}")
     print(f"  - Learning rate: 2e-4 (AdamW)")
     print(f"  - Temperature: {model.temperature} → {model.min_temperature}")
+    print(f"  - TC weight: {tc_weight}")
+    print(f"  - Use baseline: {use_baseline}")
+    print(f"  - Baseline beta: {baseline_beta}")
+    print(f"  - Transport plan: {transport}")
 
     # Count parameters
     forward_params = sum(p.numel() for p in model.forward_net.parameters())
@@ -1102,7 +1421,8 @@ def main():
     print("=" * 60)
 
     # Train model
-    losses = train_model(model, train_loader, num_epochs=30)
+    losses = train_model(model, train_loader, dataset_name,
+                         output_path, num_epochs=50)
 
     # Plot training curve
     plt.figure(figsize=(10, 4))
@@ -1115,7 +1435,7 @@ def main():
     plt.title('FLDD Training Loss')
     plt.legend()
     plt.tight_layout()
-    plt.savefig('./outputs/training_curve.png', dpi=150)
+    plt.savefig(f'{output_path}/training_curve.png', dpi=150)
     plt.close()
 
     if dataset_name == "TwoGaussians":
@@ -1135,13 +1455,13 @@ def main():
             cmap="viridis",
             origin="lower"
         )
-        plt.savefig('./outputs/gaussian_samples.png')
+        plt.savefig(f'{output_path}/gaussian_samples.png')
         plt.show()
         import sys
         sys.exit(0)
 
     # Visualize diffusion process
-    visualize_diffusion_process(model, test_loader)
+    visualize_diffusion_process(model, test_loader, dataset_name, output_path)
 
     # Generate final samples
     print("\nGenerating final samples...")
@@ -1154,23 +1474,25 @@ def main():
 
     plt.suptitle(f'FLDD Final Samples (T={model.num_timesteps} steps)')
     plt.tight_layout()
-    plt.savefig('./outputs/final_samples.png', dpi=150)
+    plt.savefig(f'{output_path}/final_samples.png', dpi=150)
     plt.close()
 
-    # Save model
     torch.save({
         'forward_net': model.forward_net.state_dict(),
         'reverse_net': model.reverse_net.state_dict(),
         'config': {
             'vocab_size': model.vocab_size,
             'num_timesteps': model.num_timesteps,
-            'total_steps_trained': model.current_step
+            'total_steps_trained': model.current_step,
+            'tc_weight': tc_weight,
+            'use_baseline': use_baseline,
+            'baseline_beta': baseline_beta
         }
-    }, './outputs/fldd_mnist_final.pth')
+    }, f'./{output_path}/fldd_mnist_final.pth')
 
     print(f"\n{'=' * 60}")
     print(f"✓ Training complete!")
-    print(f"✓ Model saved to ./outputs/fldd_mnist_final.pth")
+    print(f"✓ Model saved to {output_path}/fldd_mnist_final.pth")
     print(f"✓ Total steps trained: {model.current_step:,}")
     print(f"{'=' * 60}")
 
