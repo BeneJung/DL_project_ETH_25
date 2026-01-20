@@ -1128,124 +1128,129 @@ def train_model(model: FLDD, train_loader, dataset, output_path, num_epochs=None
     """
     Training loop following paper specifications.
     """
+    from contextlib import ExitStack
+    from SinkhornTransport import SinkhornTransportModel
+    
     losses = []
 
     # Initialize FID metric only for image datasets
     fid = None
     max_fid_samples = 2048  # Limit samples for FID to save memory
     tc_weight = 1e-4
-    if dataset == "MNIST":
-        fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-        f = open(f"{output_path}/mnist_fid_tc{tc_weight:.0e}.csv", "w")
-    from SinkhornTransport import SinkhornTransportModel
-    if isinstance(model.transport_plan, SinkhornTransportModel):
-        f2 = open(f"{output_path}/sinkhorn_transport_params.csv", "w")
+    
+    # Use ExitStack to manage multiple file handles that may or may not be opened
+    with ExitStack() as stack:
+        if dataset == "MNIST":
+            fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+            f = stack.enter_context(open(f"{output_path}/mnist_fid_tc{tc_weight:.0e}.csv", "w"))
+        else:
+            f = None
+            
+        if isinstance(model.transport_plan, SinkhornTransportModel):
+            f2 = stack.enter_context(open(f"{output_path}/sinkhorn_transport_params.csv", "w"))
+        else:
+            f2 = None
 
-    # Calculate epochs based on total steps
-    steps_per_epoch = len(train_loader)
-    if num_epochs is None:
-        total_epochs = (model.total_steps +
-                        steps_per_epoch - 1) // steps_per_epoch
-    else:
-        total_epochs = num_epochs
+        # Calculate epochs based on total steps
+        steps_per_epoch = len(train_loader)
+        if num_epochs is None:
+            total_epochs = (model.total_steps +
+                            steps_per_epoch - 1) // steps_per_epoch
+        else:
+            total_epochs = num_epochs
 
-    print(
-        f"Training for {model.total_steps} total steps (~{total_epochs} epochs)")
-    print(
-        f"Warmup: {model.warmup_steps} steps, REINFORCE: {model.reinforce_steps} steps")
+        print(
+            f"Training for {model.total_steps} total steps (~{total_epochs} epochs)")
+        print(
+            f"Warmup: {model.warmup_steps} steps, REINFORCE: {model.reinforce_steps} steps")
 
-    for epoch in range(total_epochs):
-        epoch_losses = []
-        real_images = []
-        total_samples = 0
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{total_epochs}')
+        for epoch in range(total_epochs):
+            epoch_losses = []
+            real_images = []
+            total_samples = 0
+            pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{total_epochs}')
 
-        # TODO: think about whether we should train in batches or, as in the paper, with single datapoints
-        for batch_idx, (data, _) in enumerate(pbar):
+            # TODO: think about whether we should train in batches or, as in the paper, with single datapoints
+            for batch_idx, (data, _) in enumerate(pbar):
+                if model.current_step >= model.total_steps:
+                    break
+
+                # In case of MNIST converts [batch, 1, H, W] → [batch, H, W]
+                data = data.squeeze().to(device)
+
+                # Training step
+                loss = model.train_step(data)
+                epoch_losses.append(loss)
+
+                # Accumulate real images for FID (only for MNIST)
+                if fid is not None and total_samples < max_fid_samples:
+                    # Convert grayscale to RGB
+                    # [batch, 1, H, W] -> [batch, 3, H, W]
+                    real_rgb = data.unsqueeze(1).repeat(1, 3, 1, 1)
+                    real_images.append(real_rgb)
+                    total_samples += data.shape[0]
+
+                # Update progress bar
+                if batch_idx % 20 == 0:
+                    phase = 'warmup' if model.current_step < model.warmup_steps else 'REINFORCE'
+                    pbar.set_postfix({
+                        'loss': f'{loss:.4f}',
+                        'temp': f'{model.temperature:.5f}',
+                        'phase': phase,
+                        'step': f'{model.current_step}/{model.total_steps}'
+                    })
+
+            # Epoch statistics
+            avg_loss = np.mean(epoch_losses) if epoch_losses else 0
+            losses.append(avg_loss)
+            print(f'Epoch {epoch+1}: Avg Loss = {avg_loss:.4f}')
+            if f2 is not None:
+                print("Transport Plan Parameters:")
+                f2.write(f"{epoch}")
+                for name, param in model.transport_plan.named_parameters():
+                    print(f"  {name}: {param}")
+                    f2.write(f"{name}, {param}\n")
+
+            # Generate samples periodically
+            if (epoch + 1) % 5 == 0 or epoch == 0:
+                visualize_samples(model, epoch + 1, "", save_dir=output_path)
+
+                # Compute FID only for image datasets like MNIST
+                from torchvision.transforms import Resize
+
+                if dataset == "MNIST" and real_images:
+                    batch_size_fid = 128
+                    sample_shape = (28, 28)
+
+                    # --- Real images ---
+                    for batch_real in real_images:
+                        batch_rgb = batch_real
+                        fid.update(batch_rgb.to(device), real=True)
+                        del batch_rgb
+                        torch.cuda.empty_cache()
+
+                    # --- Fake images ---
+                    num_samples = sum(img.shape[0] for img in real_images)
+                    for i in range(0, num_samples, batch_size_fid):
+                        curr_batch_size = min(batch_size_fid, num_samples - i)
+                        fake_batch = model.sample(
+                            num_samples=curr_batch_size, sample_shape=sample_shape)
+                        if fake_batch.ndim == 3:
+                            fake_batch = fake_batch.unsqueeze(1)
+                        fake_rgb = fake_batch.repeat(1, 3, 1, 1).to(device)
+                        fid.update(fake_rgb, real=False)
+                        del fake_rgb
+                        torch.cuda.empty_cache()
+
+                    # --- Calcolo finale FID ---
+                    fid_score = fid.compute()
+                    print(f'Epoch {epoch+1}: FID = {fid_score:.4f}')
+                    f.write(f'{epoch}, {fid_score:.4f}\n')
+                    fid.reset()
+                    torch.cuda.empty_cache()
+
             if model.current_step >= model.total_steps:
                 break
-
-            # In case of MNIST converts [batch, 1, H, W] → [batch, H, W]
-            data = data.squeeze().to(device)
-
-            # Training step
-            loss = model.train_step(data)
-            epoch_losses.append(loss)
-
-            # Accumulate real images for FID (only for MNIST)
-            if fid is not None and total_samples < max_fid_samples:
-                # Convert grayscale to RGB
-                # [batch, 1, H, W] -> [batch, 3, H, W]
-                real_rgb = data.unsqueeze(1).repeat(1, 3, 1, 1)
-                real_images.append(real_rgb)
-                total_samples += data.shape[0]
-
-            # Update progress bar
-            if batch_idx % 20 == 0:
-                phase = 'warmup' if model.current_step < model.warmup_steps else 'REINFORCE'
-                pbar.set_postfix({
-                    'loss': f'{loss:.4f}',
-                    'temp': f'{model.temperature:.5f}',
-                    'phase': phase,
-                    'step': f'{model.current_step}/{model.total_steps}'
-                })
-
-        # Epoch statistics
-        avg_loss = np.mean(epoch_losses) if epoch_losses else 0
-        losses.append(avg_loss)
-        print(f'Epoch {epoch+1}: Avg Loss = {avg_loss:.4f}')
-        if isinstance(model.transport_plan, SinkhornTransportModel):
-            print("Transport Plan Parameters:")
-            f2.write(f"{epoch}")  # type:ignore
-            for name, param in model.transport_plan.named_parameters():
-                print(f"  {name}: {param}")
-                f2.write(f"{name}, {param}\n")  # type:ignore
-
-        # Generate samples periodically
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            visualize_samples(model, epoch + 1, "", save_dir=output_path)
-
-            # Compute FID only for image datasets like MNIST
-            from torchvision.transforms import Resize
-
-            if dataset == "MNIST" and real_images:
-                batch_size_fid = 128
-                sample_shape = (28, 28)
-
-                # --- Real images ---
-                for batch_real in real_images:
-                    batch_rgb = batch_real
-                    fid.update(batch_rgb.to(device), real=True)
-                    del batch_rgb
-                    torch.cuda.empty_cache()
-
-                # --- Fake images ---
-                num_samples = sum(img.shape[0] for img in real_images)
-                for i in range(0, num_samples, batch_size_fid):
-                    curr_batch_size = min(batch_size_fid, num_samples - i)
-                    fake_batch = model.sample(
-                        num_samples=curr_batch_size, sample_shape=sample_shape)
-                    if fake_batch.ndim == 3:
-                        fake_batch = fake_batch.unsqueeze(1)
-                    fake_rgb = fake_batch.repeat(1, 3, 1, 1).to(device)
-                    fid.update(fake_rgb, real=False)
-                    del fake_rgb
-                    torch.cuda.empty_cache()
-
-                # --- Calcolo finale FID ---
-                fid_score = fid.compute()
-                print(f'Epoch {epoch+1}: FID = {fid_score:.4f}')
-                f.write(f'{epoch}, {fid_score:.4f}\n')
-                fid.reset()
-                torch.cuda.empty_cache()
-
-        if model.current_step >= model.total_steps:
-            break
-
-    if dataset == "MNIST":
-        f.close()  # type:ignore
-    if isinstance(model.transport_plan, SinkhornTransportModel):
-        f2.close() # type:ignore
 
     return losses
 
