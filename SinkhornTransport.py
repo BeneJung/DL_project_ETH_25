@@ -211,7 +211,6 @@ import argparse
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--tc_weight', type=float, default=1e-4, help='TC weight for training')
-    parser.add_argument('--other_param', type=int, default=42, help='Another parameter')
     parser.add_argument('--transport', type=str, default="maximum", help='Transport method')
     args = parser.parse_args()
 
