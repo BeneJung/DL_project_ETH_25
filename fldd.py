@@ -970,8 +970,6 @@ class FLDD:
             tc_loss = self.estimate_tc_mws(u_s_given_t, z_s_sampled)
 
             total_loss = total_loss + self.tc_weight * tc_loss
-        else:
-            total_loss = total_loss
 
         return total_loss
 
