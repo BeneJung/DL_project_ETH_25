@@ -17,7 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from dask.array import shape
-from distributed.diagnostics.plugin import forward_stream
 from torch.distributions import Categorical, RelaxedOneHotCategorical
 import numpy as np
 from torchvision import datasets, transforms
