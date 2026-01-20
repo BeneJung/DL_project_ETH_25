@@ -18,7 +18,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from dask.array import shape
-from distributed.diagnostics.plugin import forward_stream
 from torch.distributions import Categorical, RelaxedOneHotCategorical
 import numpy as np
 from torchvision import datasets, transforms
@@ -35,7 +34,8 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 
 # Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
+if __name__ == "__main__":
+    print(f"Using device: {device}")
 
 
 # =============================================================================
@@ -971,8 +971,6 @@ class FLDD:
             tc_loss = self.estimate_tc_mws(u_s_given_t, z_s_sampled)
 
             total_loss = total_loss + self.tc_weight * tc_loss
-        else:
-            total_loss = total_loss
 
         return total_loss
 
@@ -1143,7 +1141,64 @@ def train_model(model: FLDD, train_loader, dataset, output_path, num_epochs=None
             f = stack.enter_context(open(f"{output_path}/mnist_fid_tc{model.tc_weight:.0e}.csv", "w"))
         else:
             f = None
-            
+
+    from SinkhornTransport import SinkhornTransportModel
+    if isinstance(model.transport_plan, SinkhornTransportModel):
+        f2 = open(f"{output_path}/sinkhorn_transport_params.csv", "w")
+
+    # Calculate epochs based on total steps
+    steps_per_epoch = len(train_loader)
+    if num_epochs is None:
+        total_epochs = (model.total_steps +
+                        steps_per_epoch - 1) // steps_per_epoch
+    else:
+        total_epochs = num_epochs
+
+    print(
+        f"Training for {model.total_steps} total steps (~{total_epochs} epochs)")
+    print(
+        f"Warmup: {model.warmup_steps} steps, REINFORCE: {model.reinforce_steps} steps")
+
+    for epoch in range(total_epochs):
+        epoch_losses = []
+        real_images = []
+        total_samples = 0
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{total_epochs}')
+
+        # TODO: think about whether we should train in batches or, as in the paper, with single datapoints
+        for batch_idx, (data, _) in enumerate(pbar):
+            if model.current_step >= model.total_steps:
+                break
+
+            # In case of MNIST converts [batch, 1, H, W] → [batch, H, W]
+            data = data.squeeze().to(device)
+
+            # Training step
+            loss = model.train_step(data)
+            epoch_losses.append(loss)
+
+            # Accumulate real images for FID (only for MNIST)
+            if fid is not None and total_samples < max_fid_samples:
+                # Convert grayscale to RGB
+                # [batch, 1, H, W] -> [batch, 3, H, W]
+                real_rgb = data.unsqueeze(1).repeat(1, 3, 1, 1)
+                real_images.append(real_rgb)
+                total_samples += data.shape[0]
+
+            # Update progress bar
+            if batch_idx % 20 == 0:
+                phase = 'warmup' if model.current_step < model.warmup_steps else 'REINFORCE'
+                pbar.set_postfix({
+                    'loss': f'{loss:.4f}',
+                    'temp': f'{model.temperature:.5f}',
+                    'phase': phase,
+                    'step': f'{model.current_step}/{model.total_steps}'
+                })
+
+        # Epoch statistics
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0
+        losses.append(avg_loss)
+        print(f'Epoch {epoch+1}: Avg Loss = {avg_loss:.4f}')
         if isinstance(model.transport_plan, SinkhornTransportModel):
             f2 = stack.enter_context(open(f"{output_path}/sinkhorn_transport_params.csv", "w"))
         else:

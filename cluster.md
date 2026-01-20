@@ -26,7 +26,7 @@ After logging in the cluster:
 
   ```
 
-- clearing clash
+- clearing cache
   ```bash
   export 'PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True'
   ```
