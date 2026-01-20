@@ -11,7 +11,6 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 # fix for certificate error
-import os
 import certifi
 
 # Set environment variables to use certifi's bundle
