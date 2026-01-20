@@ -56,7 +56,6 @@ class SinkhornTransportModel(nn.Module):
           P: optimal transport matrix of shape (K, K), res[r, c] = q_(z_s = r, z_t = s)
           err: Error
         """
-        # print(self.learnable, self.C)
         ndim = a.ndim
         eps = 1e-8
         P: torch.Tensor = torch.exp(-self.C / self.lam)
