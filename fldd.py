@@ -12,6 +12,7 @@ Key Concepts:
 """
 
 import argparse
+from contextlib import ExitStack
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +29,7 @@ import math
 import os
 
 from two_gaussians import TwoGaussians
+from SinkhornTransport import SinkhornTransportModel
 
 from torchmetrics.image.fid import FrechetInceptionDistance
 
@@ -1128,21 +1130,17 @@ def train_model(model: FLDD, train_loader, dataset, output_path, num_epochs=None
     """
     Training loop following paper specifications.
     """
-    from contextlib import ExitStack
-    from SinkhornTransport import SinkhornTransportModel
-    
     losses = []
 
     # Initialize FID metric only for image datasets
     fid = None
     max_fid_samples = 2048  # Limit samples for FID to save memory
-    tc_weight = 1e-4
     
     # Use ExitStack to manage multiple file handles that may or may not be opened
     with ExitStack() as stack:
         if dataset == "MNIST":
             fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-            f = stack.enter_context(open(f"{output_path}/mnist_fid_tc{tc_weight:.0e}.csv", "w"))
+            f = stack.enter_context(open(f"{output_path}/mnist_fid_tc{model.tc_weight:.0e}.csv", "w"))
         else:
             f = None
             
