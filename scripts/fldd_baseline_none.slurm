@@ -1,20 +1,19 @@
 #!/bin/bash
 #SBATCH -A deep_learning
-#SBATCH -t 840                # 14 hours
-#SBATCH --job-name=fldd_b09
-#SBATCH --output=logs/fldd_baseline_09_%j.log
-#SBATCH --error=logs/fldd_baseline_09_%j.log
+#SBATCH -t 1440                # 24 hours
+#SBATCH --job-name=fldd_none
+#SBATCH --output=logs/fldd_baseline_none_%j.log
+#SBATCH --error=logs/fldd_baseline_none_%j.log
 
 source ~/venv/bin/activate
 
-echo "Starting grid search: Baseline with 0.9 decay"
+echo "Starting grid search: Baseline = None (use_baseline=False)"
 echo "=================================================="
-echo "Running all TC weights with use_baseline=True, baseline_beta=0.9"
+echo "Running all TC weights with use_baseline=False"
 echo "=================================================="
 
 # TC weight values
 tc_weights=(10 1 0.1 0.01 0.001 0.0001 0)
-baseline_beta=0.9
 
 # Counter
 run_exps=0
@@ -22,10 +21,10 @@ run_exps=0
 for tc in "${tc_weights[@]}"; do
     ((run_exps++))
     
-    echo "=== RUNNING combination $run_exps/${#tc_weights[@]}: tc_weight=$tc, baseline_beta=$baseline_beta ==="
+    echo "=== RUNNING combination $run_exps/${#tc_weights[@]}: tc_weight=$tc, use_baseline=False ==="
     echo "Start: $(date)"
     
-    python fldd.py --tc_weight $tc --use_baseline True --baseline_beta $baseline_beta --transport sinkhorn_learnable
+    python fldd.py --tc_weight $tc --use_baseline False --transport sinkhorn_learnable
     
     if [ $? -eq 0 ]; then
         echo "Status: SUCCESS"
@@ -38,8 +37,8 @@ for tc in "${tc_weights[@]}"; do
 done
 
 echo "=================================================="
-echo "JOB 3 COMPLETE: Baseline with 0.9 decay"
+echo "JOB 1 COMPLETE: Baseline = None"
 echo "=================================================="
 echo "Total experiments run: $run_exps"
-echo "All TC weights with baseline_beta=0.9 completed"
-echo "Finished at: $(date)" 
+echo "All TC weights with use_baseline=False completed"
+echo "Finished at: $(date)"
